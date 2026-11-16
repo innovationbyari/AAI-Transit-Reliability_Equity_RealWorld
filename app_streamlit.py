@@ -62,6 +62,28 @@ def _export_secrets():
         pass
 
 
+def _import_engine(app_dir):
+    """The v7 engine normally lives in the transit_ai/ folder. GitHub's web upload can flatten folders, putting its files
+    (__init__.py, _modules.json, live_ops.py, …) next to this app instead. Both layouts work."""
+    import importlib.util
+    try:
+        from transit_ai import load
+        return load
+    except ModuleNotFoundError as e:
+        if e.name != "transit_ai":
+            raise
+    init = os.path.join(app_dir, "__init__.py")
+    if os.path.exists(init) and os.path.exists(os.path.join(app_dir, "_modules.json")):
+        spec = importlib.util.spec_from_file_location("transit_ai", init, submodule_search_locations=[app_dir])
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["transit_ai"] = mod
+        spec.loader.exec_module(mod)
+        return mod.load
+    st.error("The v7 engine files are missing. Upload the transit_ai folder (or its files) next to app_streamlit.py: "
+             "__init__.py, _modules.json, live_ops.py and the other section files.")
+    st.stop()
+
+
 @st.cache_resource(show_spinner="Starting up: loading the v7 engine and connecting to NJ Transit, Census and the weather service …")
 def load_core():
     _export_secrets()
@@ -71,7 +93,7 @@ def load_core():
     if app_dir not in sys.path:
         sys.path.insert(0, app_dir)
     import threading
-    from transit_ai import load
+    load = _import_engine(app_dir)
     import team_ops
     tc = load(verbose=False)
     team_ops.setup(tc)
