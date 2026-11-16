@@ -1,13 +1,13 @@
-# Shared by the Streamlit and Gradio apps (Streamlit Cloud and Hugging Face Spaces read this file)
-gradio>=5.0
-streamlit>=1.46
-pandas>=2.1
-requests>=2.31
-pydantic>=2.6
-folium>=0.15
-plotly>=5.18
-matplotlib>=3.8
-numpy>=1.26
-gtfs-realtime-bindings>=1.0
+# Streamlit Community Cloud installs these. (Optional camera model + FLAN-T5: requirements-ml.txt)
+streamlit==1.67.0
+folium
+plotly
+pandas
+requests
+pydantic>=2
+ipywidgets            # v7 Section B form classes import it; nothing is displayed in the web app
+matplotlib
+numpy<3
+gtfs-realtime-bindings
 protobuf>=5.29.1,<7
-opencv-python-headless>=4.9
+opencv-python-headless>=4.9,<5   # OpenCV 5 removed the people detector v7 uses as its camera fallback

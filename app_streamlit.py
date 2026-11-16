@@ -1,25 +1,30 @@
-"""Streamlit app — Agentic AI for Public Transit Reliability and Equity.
+"""Transit Reliability & Equity — live, human-in-the-loop dashboard on the v7 engine (Streamlit).
 
 Run locally:  streamlit run app_streamlit.py
-Streamlit Community Cloud: set the main file to app_streamlit.py and add the keys under App settings → Secrets:
-    NJ_TRANSIT_USERNAME = "..."     NJ_TRANSIT_PASSWORD = "..."
-    CENSUS_API_KEY = "..."          (optional)   NWS_CONTACT_EMAIL = "..."   (optional)
-    OPENAI_API_KEY = "..."          (optional LLM narratives)
-    DASHBOARD_PASSWORD = "..."      (recommended: protects the public URL)
-All cases come from live NJ Transit vehicles; there is no sample data. Case state is shared by everyone using the app
-(so a second reviewer can open the same case), and resets when the app restarts.
+Streamlit Community Cloud: main file app_streamlit.py; keys go in App settings → Secrets
+(see .streamlit/secrets.toml.example and README.md).
+
+How it flows
+  Step 1  Live buses: pull the live NJ Transit feed and open a case for a delayed or cancelled bus.
+  Step 2  Who are you? Pick your role: Dispatcher (1st reviewer), Supervisor (2nd reviewer),
+          Operations Officer (carries out the action, alerts the driver) or Bus Driver (acknowledges).
+  Then    "My task" shows exactly what your role needs to do on the selected case.
+Every case comes from a live NJ Transit bus. The v7 notebook engine (transit_ai/) scores it; inputs with no live source
+use v7's documented samples and are labelled. Case state is shared by everyone using the app.
 """
+import hmac
 import json
 import os
-import time
-from datetime import timedelta
+import sys
 
 import streamlit as st
 import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Transit Reliability & Equity", page_icon="🚌", layout="wide")
+ss = st.session_state
 
 
+# ================================================================================================ access
 def _dashboard_password():
     try:
         v = st.secrets.get("DASHBOARD_PASSWORD")
@@ -29,34 +34,48 @@ def _dashboard_password():
 
 
 def password_gate():
-    """A public URL spends the app's API keys, so DASHBOARD_PASSWORD (when set) is required before anything loads."""
-    import hmac
     pw = _dashboard_password()
-    if not pw or st.session_state.get("authenticated"):
+    if not pw or ss.get("authenticated"):
         return
-    st.title("🚌 Transit Reliability & Equity")
+    st.markdown("## 🚌 Transit Reliability & Equity")
+    st.caption("Live bus disruption response · Newark Penn Station area")
     with st.form("login"):
         typed = st.text_input("Dashboard password", type="password")
-        if st.form_submit_button("Sign in"):
+        if st.form_submit_button("Sign in", type="primary"):
             if hmac.compare_digest(typed.encode(), str(pw).encode()):
-                st.session_state["authenticated"] = True
+                ss["authenticated"] = True
                 st.rerun()
             st.error("Wrong password.")
     st.stop()
 
 
 password_gate()
-if not _dashboard_password():
-    st.warning("No DASHBOARD_PASSWORD secret is set, so anyone with this URL can use the app and its API keys.")
 
 
-@st.cache_resource(show_spinner="Loading the transit engine …")
+def _export_secrets():
+    """v7 reads keys and settings from environment variables: copy Streamlit secrets there first."""
+    try:
+        for k, v in st.secrets.items():
+            if isinstance(v, (str, int, float, bool)):
+                os.environ.setdefault(k, str(v))
+    except Exception:
+        pass
+
+
+@st.cache_resource(show_spinner="Starting up: loading the v7 engine and connecting to NJ Transit, Census and the weather service …")
 def load_core():
-    for k in ("TRANSIT_USE_SLM", "TRANSIT_USE_CV"):          # heavy local models are off unless the host turns them on
-        os.environ.setdefault(k, "0")
+    _export_secrets()
+    for k in ("USE_CV", "USE_SLM"):            # camera model and FLAN-T5 need ~1.5 GB: off unless turned on in Secrets
+        os.environ.setdefault(k, "false")
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    if app_dir not in sys.path:
+        sys.path.insert(0, app_dir)
     import threading
-    import transit_core as tc
-    if tc.read_secret("NJ_TRANSIT_USERNAME"):         # warm up: first live pull + static GTFS in the background
+    from transit_ai import load
+    import team_ops
+    tc = load(verbose=False)
+    team_ops.setup(tc)
+    if tc.read_secret("NJ_TRANSIT_USERNAME"):         # live pull + NJ Transit route data in the background
         def warm():
             try:
                 tc.refresh_live_context()
@@ -64,358 +83,575 @@ def load_core():
             except Exception as e:
                 tc.APP.last_message = f"Start-up live pull failed: {e}"
         threading.Thread(target=warm, daemon=True).start()
-    return tc
+    return tc, team_ops
 
 
-tc = load_core()
+tc, T = load_core()
+T.setup(tc)
 APP = tc.APP
+TEAM = T.team(tc)
+
+# ================================================================================================ style
+st.markdown("""
+<style>
+.block-container {padding-top: 3.2rem; max-width: 1400px}
+h1, h2, h3 {letter-spacing: -0.01em}
+.hero {display:flex; align-items:center; gap:14px; margin-bottom: 4px}
+.hero .t {font-size: 1.65rem; font-weight: 700}
+.hero .s {color:#6b7280; font-size: .95rem}
+.card {border:1px solid #e5e7eb; border-radius:14px; padding:14px 16px; background:#fff; margin-bottom:10px}
+.case-card {border-left:6px solid var(--c, #2563eb)}
+.pill {display:inline-block; padding:2px 10px; border-radius:999px; font-size:.8rem; font-weight:600; color:#fff;
+       background: var(--c, #2563eb)}
+.muted {color:#6b7280; font-size:.9rem}
+.steps {display:flex; gap:8px; flex-wrap:wrap; margin: 8px 0 14px 0}
+.step {flex:1; min-width:130px; padding:9px 11px; border-radius:12px; border:1px solid #e5e7eb; background:#f9fafb;
+       font-size:.85rem; line-height:1.25}
+.step b {display:block; font-size:.75rem; color:#6b7280; font-weight:600; text-transform:uppercase; letter-spacing:.04em}
+.step.done {background:#ecfdf5; border-color:#a7f3d0}
+.step.current {background:#eff6ff; border-color:#2563eb; box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+.step.skipped, .step.stopped {opacity:.5}
+.alert-sms {border:1px solid #fde68a; background:#fffbeb; border-radius:14px; padding:14px 16px; margin-bottom:10px}
+.alert-sms.ack {border-color:#a7f3d0; background:#ecfdf5}
+.big {font-size:1.05rem; line-height:1.45}
+</style>
+""", unsafe_allow_html=True)
+
+STATUS_WORDS = {
+    "AWAITING_REVIEW": ("Waiting for the dispatcher", "#dc2626"),
+    "AWAITING_SECOND_REVIEW": ("Waiting for the supervisor", "#b91c1c"),
+    "AWAITING_IMPLEMENTATION": ("Approved: waiting for the operations officer", "#7c3aed"),
+    "IMPLEMENTED": ("Carried out: outcome to be recorded", "#059669"),
+    "EVALUATED": ("Closed: outcome recorded", "#047857"),
+    "SAFE_DEFAULT": ("Safe default: rider information only, monitoring", "#2563eb"),
+    "MONITORING": ("Monitoring: data not strong enough to act yet", "#6b7280"),
+    "CONFLICT_REVIEW": ("Data sources disagree: dispatcher check needed", "#d97706"),
+    "CLOSED_FALSE_ALARM": ("Closed as a false alarm", "#9ca3af"),
+}
+STEP_ICON = {"done": "✅", "current": "👉", "waiting": "⏳", "skipped": "➖", "stopped": "⏸️"}
 
 
+# ================================================================================================ helpers
 def run(fn, *a, ok=None, **k):
-    """Run a store action; show refusals (gates, rubber-stamp checks, deadlines, missing live data) instead of crashing."""
+    """Run an action; show refusals (training gate, missing reason, deadline …) as a message instead of crashing."""
     with APP.lock:
         try:
             out = fn(*a, **k)
-            st.session_state["flash"] = ("ok", ok or APP.last_message)
+            ss["flash"] = ("ok", ok or APP.last_message)
             return out
         except (ValueError, KeyError, tc.LiveDataUnavailable) as e:
-            st.session_state["flash"] = ("err", str(e))
+            ss["flash"] = ("err", str(e))
             return None
-
-
-def active():
-    cid = st.session_state.get("case_id") or APP.active_id
-    c = APP.cases.get(cid)
-    if c and c["status"] in tc.REVIEW_STATUSES:
-        APP.enforce_deadline(c)
-    return c
 
 
 def show_df(df, **k):
     df = df.copy()
-    for col in df.columns:                      # mixed-type columns (numbers and labels) display as text
+    for col in df.columns:
         if df[col].dtype == object:
             df[col] = df[col].map(lambda x: x if x is None or isinstance(x, str) else str(x))
     st.dataframe(df, width="stretch", hide_index=True, **k)
 
 
-# ---------------------------------------------------------------- sidebar: live data and case selection
+def case_label(c):
+    words = STATUS_WORDS.get(c["status"], (c["status"], ""))[0]
+    route = c["raw"].get("route_name") or c["raw"].get("route_id")
+    return f"{c['case_id']} · Route {route} · {words}"
+
+
+def pick_case():
+    """The case shown to this person: their own pick, else the newest case waiting for their role, else the newest."""
+    ids = list(APP.cases)[::-1]
+    if not ids:
+        return None
+    if ss.get("case_id") in APP.cases:
+        cid = ss["case_id"]
+    else:
+        mine = [i for i in ids if T.whose_turn(tc, APP.cases[i]) == ss.get("role")]
+        cid = (mine or ids)[0]
+    c = APP.cases[cid]
+    if c["status"] in tc.REVIEW_STATUSES:
+        with APP.lock:
+            APP.enforce_deadline(c)
+    return c
+
+
+def fmt_delay(c):
+    f = c["analysis"].get("fields", {})
+    if f.get("cancelled"):
+        return "trip cancelled"
+    d = f.get("delay_min")
+    return "delay unknown" if d is None else f"{d:.0f} min late"
+
+
+def ranked_options(c):
+    return c["analysis"].get("ranking", [])
+
+
+def option_text(c, oid):
+    o = next((o for o in c["analysis"].get("options", []) if o["option_id"] == oid), None)
+    return o["label"] if o else str(oid)
+
+
+def simple_options_df(c):
+    import pandas as pd
+    rows = [{"Rank": r["rank"], "Action": r["label"] + (" (v7 model depot)" if r["option_id"].startswith("dispatch_second_bus") else "")
+             + ("  ← recommended" if r["rank"] == 1 else ""),
+             "Estimated cost": f"${next((o['cost_usd'] for o in c['analysis']['options'] if o['option_id'] == r['option_id']), 0):,.0f}"}
+            for r in ranked_options(c)]
+    return pd.DataFrame(rows) if rows else tc.ph(None, "No action is possible right now")
+
+
+def plain_summary(c):
+    """Two or three sentences a non-specialist can follow. The technical explanation stays one click away."""
+    raw, A = c["raw"], c["analysis"]
+    f = A.get("fields", {})
+    route = raw.get("route_name") or raw.get("route_id")
+    stop = ((raw.get("real") or {}).get("stops") or [{}])[0].get("name")
+    what = "a trip is cancelled" if f.get("cancelled") else (
+        f"the bus is running about {f['delay_min']:.0f} minutes late" if f.get("delay_min") is not None else "there is a service problem")
+    parts = [f"On **Route {route}**, {what}" + (f" near **{stop}**." if stop else ".")]
+    td = f.get("transit_dependence")
+    if td is not None:
+        parts.append(f"In the neighborhoods along the next stops, about **{td:.0%} of households have no car**, so riders "
+                     "depend on this bus.")
+    rk = ranked_options(c)
+    if rk:
+        model = " (this uses a v7 model depot, not a real one)" if rk[0]["option_id"].startswith("dispatch_second_bus") else ""
+        parts.append(f"The system recommends **{rk[0]['label']}**{model}" +
+                     (f" (best of {len(rk)} possible actions)." if len(rk) > 1 else ".") + " You make the final decision.")
+    else:
+        parts.append("No action is possible right now, so the safe default applies: rider information only.")
+    return " ".join(parts)
+
+
+def explain_more(c):
+    ex = c.get("explanation") or {}
+    with st.expander("Why? (detailed explanation)"):
+        if ex.get("narrative"):
+            st.markdown(ex["narrative"])
+        st.markdown(ex.get("brief_md") or "")
+
+
+def countdown(c):
+    if c["status"] not in tc.REVIEW_STATUSES:
+        return
+    left = max(0, int(APP.seconds_left(c)))
+    mm, s = divmod(left, 60)
+    who = "supervisor" if c["status"] == "AWAITING_SECOND_REVIEW" else "dispatcher"
+    color = "#dc2626" if left < 60 else "#d97706" if left < 180 else "#059669"
+    st.markdown(f"<div class='card' style='border-color:{color}'>⏱️ <b style='color:{color}'>{mm:02d}:{s:02d}</b> left for the "
+                f"{who}. If nobody decides in time, the system falls back to the safe default (rider information only).</div>",
+                unsafe_allow_html=True)
+
+
+@st.fragment(run_every=5)
+def live_countdown(cid):
+    """Ticks every 5 s; when the deadline passes, the case goes to the safe default and the whole page refreshes."""
+    c = APP.cases.get(cid)
+    if not c or c["status"] not in tc.REVIEW_STATUSES:
+        return
+    with APP.lock:
+        expired = APP.enforce_deadline(c)
+    if expired:
+        st.rerun(scope="app")
+    countdown(c)
+
+
+def checklist(prefix):
+    st.markdown("**Before you decide, confirm:**")
+    done = [t for t in tc.REVIEW_CHECKLIST if st.checkbox(t, key=f"{prefix}_{t}")]
+    viewed = any("alternative" in t.lower() for t in done)        # the checklist item covers reviewing all alternatives
+    return done, viewed
+
+
+# ================================================================================================ sidebar
 with st.sidebar:
-    st.header("🚌 Live data")
-    if st.button("↻ Pull live data (NJ Transit · Census · NWS)", width="stretch"):
-        with st.spinner("Pulling live feeds …"):
-            run(tc.refresh_live_context, ok="Live data pulled.")
-            with st.spinner("Loading NJ Transit static GTFS (first time can take a few minutes) …"):
-                tc.network_or_none()
-    st.markdown(tc.live_status_md())
-    choices = tc.vehicle_choices()
-    labels = {vid: lab for lab, vid in choices}
-    vid = st.selectbox("Live vehicle", [vid for _, vid in choices], format_func=lambda v: labels.get(v, v),
-                       index=None, placeholder="pull live data first" if not choices else "pick a vehicle")
-    use_llm = st.checkbox("Live LLM narrative", value=tc.LLM_READY, disabled=not tc.LLM_READY)
-    if st.button("▶ Run pipeline on this vehicle", type="primary", width="stretch", disabled=vid is None):
-        with st.spinner("Signal Scout → verification → scoring → planner → explanation …"):
-            c = run(lambda: APP.new_case(tc.raw_for_vehicle(vid, store=APP), use_llm=use_llm))
-        if c:
-            st.session_state["case_id"] = c["case_id"]
-    st.divider()
+    st.markdown("### 🚌 Transit Response")
+    st.caption("Newark Penn Station area · live NJ Transit data")
+
+    st.markdown("#### Step 1 · Live buses")
+    if st.button("↻ Refresh live data", width="stretch", type="primary"):
+        with st.spinner("Pulling NJ Transit, Census and weather …"):
+            run(tc.refresh_live_context, ok="Live data refreshed.")
+            tc.network_or_none()
+        st.rerun()
+    nj = tc.LIVE_CONTEXT["nj_transit"]
+    n_bus = len(tc.live_vehicles())
+    net_ok = tc._NETWORK.get("net") is not None
+    st.markdown(
+        f"{'🟢' if n_bus else '⚪'} **{n_bus}** live buses nearby  \n"
+        f"{'🟢' if net_ok else '🟡'} Route map {'ready' if net_ok else 'loading'}  \n"
+        f"{'🟢' if tc.LIVE_CONTEXT['weather'].get('source') == 'NWS live' else '⚪'} Weather "
+        f"{tc.LIVE_CONTEXT['weather'].get('current_conditions') or ''}  \n"
+        f"<span class='muted'>Updated {(nj.get('fetched_at') or 'not yet')[11:16]} UTC</span>", unsafe_allow_html=True)
+
+    st.markdown("#### Step 2 · Who are you?")
+    role_keys = list(T.ROLE_KEYS)
+    role = st.radio("Your role", role_keys, format_func=lambda k: T.label(TEAM[k]),
+                    index=role_keys.index(ss.get("role", "dispatcher")), label_visibility="collapsed")
+    if role != ss.get("role"):
+        ss["role"] = role
+        ss.pop("case_id", None)          # jump to the case that is waiting for this role
+    me = TEAM[role]
+    st.caption(me["does"])
+
+    st.markdown("#### Case")
     ids = list(APP.cases)[::-1]
     if ids:
-        cur = st.session_state.get("case_id") or APP.active_id
-        pick = st.selectbox("Active case", ids, index=ids.index(cur) if cur in ids else 0)
-        st.session_state["case_id"] = pick
-        APP.active_id = pick
-    st.caption(f"Rules v{APP.PM.current['version']} · {'LLM: ' + ', '.join(p['label'] for p in tc.LLM_CHAIN) if tc.LLM_READY else 'LLM off → templates'}"
-               f" · prototype: does not control live operations")
+        current = pick_case()
+        sel = st.selectbox("Case", ids, index=ids.index(current["case_id"]),
+                           format_func=lambda i: case_label(APP.cases[i]), label_visibility="collapsed")
+        ss["case_id"] = sel
+    else:
+        st.caption("No cases yet. Open one from a live bus (Live map tab).")
+    use_llm = st.toggle("AI-written explanations", value=tc.LLM_READY, disabled=not tc.LLM_READY,
+                        help="Uses your LLM key to write the plain-language explanation. The decision rules never use AI.")
 
-st.title("Transit Reliability & Equity — human-in-the-loop dashboard")
-flash = st.session_state.pop("flash", None)
+case = pick_case()
+
+# ================================================================================================ header
+st.markdown(f"<div class='hero'><div class='t'>Transit Reliability & Equity</div></div>"
+            f"<div class='s muted'>Live bus disruption response · signed in as <b>{me['name']}</b> ({me['title']})</div>",
+            unsafe_allow_html=True)
+flash = ss.pop("flash", None)
 if flash:
     (st.success if flash[0] == "ok" else st.error)(flash[1])
-case = active()
+
 if case:
-    col = tc.STATUS_COLOR.get(case["status"], "#111")
-    st.markdown(f"<span style='background:{col};color:white;padding:2px 8px;border-radius:4px'>{case['status']}</span> "
-                f"**{case['case_id']}** · {tc._html.escape(case['scenario_name'])} · "
-                f"{tc.STATUS_HELP.get(case['status'], '')}", unsafe_allow_html=True)
+    words, color = STATUS_WORDS.get(case["status"], (case["status"], "#111827"))
+    raw = case["raw"]
+    st.markdown(
+        f"<div class='card case-card' style='--c:{color}'><span class='pill' style='--c:{color}'>{words}</span>"
+        f"<div class='big' style='margin-top:6px'><b>{case['case_id']}</b> · Route <b>{raw.get('route_name') or raw.get('route_id')}</b> · "
+        f"Bus {raw.get('vehicle_id', '—')} · {fmt_delay(case)}</div>"
+        f"<div class='muted'>Next stop: {((raw.get('real') or {}).get('stops') or [{}])[0].get('name', '—')}</div></div>",
+        unsafe_allow_html=True)
+    steps = T.progress(tc, case)
+    who = {"detect": "Live feed", "dispatcher": TEAM["dispatcher"]["name"], "supervisor": TEAM["supervisor"]["name"],
+           "officer": TEAM["officer"]["name"], "driver": TEAM["driver"]["name"], "done": TEAM["officer"]["name"]}
+    st.markdown("<div class='steps'>" + "".join(
+        f"<div class='step {s}'><b>{who[k]}</b>{STEP_ICON[s]} {lab}</div>" for k, lab, s in steps) + "</div>",
+        unsafe_allow_html=True)
+    nxt = T.whose_turn(tc, case)
+    if nxt and nxt != role:
+        st.info(f"Next: **{TEAM[nxt]['name']} ({TEAM[nxt]['title']})**. Switch your role in Step 2 to act as them.")
 
-tabs = st.tabs(["1 · Intake & verification", "2 · Scores", "3 · Options", "4 · Human review", "5 · Implementation & outcome",
-                "6 · Policy governance", "7 · Ethics & independence", "8 · Audit & export"])
+tab_task, tab_map, tab_case, tab_records, tab_check, tab_help = st.tabs(
+    ["✅ My task", "🗺️ Live map", "📄 Case summary", "🗂️ Records", "🔌 System check", "❓ How to use"])
 
-# ---------------------------------------------------------------- 1 intake
-with tabs[0]:
-    left, right = st.columns([3, 2])
-    with left:
-        if hasattr(st, "iframe"):
-            st.iframe(tc.map_html(case), height=540)
-        else:
-            components.html(tc.map_html(case), height=540)
-    with right:
-        st.markdown(tc.trace_md(case), unsafe_allow_html=True)
-    st.subheader("Live vehicles near the service area")
-    show_df(tc.live_vehicles_df())
-    if case:
-        if case["raw"].get("missing_inputs"):
-            st.info("Inputs with no live source (left missing, never imputed): " + ", ".join(case["raw"]["missing_inputs"]))
-        st.subheader("Verified evidence")
-        show_df(tc.evidence_df(case))
-        a, b = st.columns(2)
-        with a:
-            st.caption("Exception log"); show_df(tc.exceptions_df(case))
-        with b:
-            st.caption("Alerts"); show_df(tc.alerts_df(case))
-        if case["status"] == "CONFLICT_REVIEW":
-            with st.form("operator"):
-                st.markdown("**Operator review — conflicting data** (max two checks, then monitoring)")
-                op = st.text_input("Operator name")
-                res = st.radio("Result", ["resolved", "unresolved"], horizontal=True,
-                               captions=["apply source precedence (vehicle data wins)", "cannot tell which source is right"])
-                if st.form_submit_button("Submit operator check"):
-                    run(APP.operator_resolve, case, op, res); st.rerun()
-    st.subheader("Monitoring queue")
-    show_df(tc.monitor_df())
-    mon_ids = [x["case_id"] for x in APP.cases.values() if x["status"] in ("MONITORING", "SAFE_DEFAULT", "CONFLICT_REVIEW")]
-    if mon_ids:
-        with st.form("monitor"):
-            m_id = st.selectbox("Case", mon_ids)
-            m_name = st.text_input("Planner name")
-            m_reason = st.text_input("Reason (for closing as a false alarm)")
-            c1, c2 = st.columns(2)
-            if c1.form_submit_button("Recheck (pull the live feed again)"):
-                run(APP.monitor_action, APP.cases[m_id], "recheck", m_name or "planner"); st.rerun()
-            if c2.form_submit_button("Close as false alarm"):
-                run(APP.close_false_alarm, APP.cases[m_id], m_name, m_reason); st.rerun()
-
-# ---------------------------------------------------------------- 2 scores
-with tabs[1]:
-    if not case:
-        st.info("Run the pipeline on a live vehicle first.")
-    else:
-        a, b = st.columns(2)
-        with a:
-            st.markdown("**Confidence** C = 0.40Q + 0.25F + 0.20G + 0.15M")
-            show_df(tc.conf_df(case))
-            st.markdown(tc.sig_md(case))
-        with b:
-            st.plotly_chart(tc.rvap_plot(case), width="stretch")
-        st.markdown("**Normalization and impact** — R = 0.30D + 0.25H + 0.25K + 0.20E · V = 0.35N + 0.25I + 0.20B + 0.20T · "
-                    "A = 0.35S + 0.30L + 0.20X + 0.15U · P = 0.40R + 0.35V + 0.25A")
-        show_df(tc.norm_df(case))
-
-# ---------------------------------------------------------------- 3 options
-with tabs[2]:
-    if not case:
-        st.info("Run the pipeline on a live vehicle first.")
-    else:
-        a, b = st.columns([3, 2])
-        with a:
-            st.caption("Scenario table and rank"); show_df(tc.options_df(case))
-            st.caption("Considered but infeasible"); show_df(tc.infeasible_df(case))
-        with b:
-            st.plotly_chart(tc.options_plot(case), width="stretch")
-        ex = case.get("explanation")
-        if ex:
-            st.markdown(ex["brief_md"])
-            st.markdown(f"**Narrative ({ex['narrative_source']}, non-authoritative):** {ex['narrative']}")
-
-# ---------------------------------------------------------------- 4 human review
-with tabs[3]:
-    if not case:
-        st.info("Run the pipeline on a live vehicle first.")
-    else:
-        @st.fragment(run_every=5)
-        def clock():
-            c = active()
-            if c:
-                st.markdown(tc.deadline_md(c))
-        clock()
-        show_df(tc.options_df(case))
-        ranking = case["analysis"].get("ranking", [])
-        opt_labels = {r["option_id"]: f"#{r['rank']} {r['label']} (Si {r['Si']:.3f})" for r in ranking}
-        names = [o.name for o in tc.ETH_ROSTER]
-        a, b = st.columns(2)
-        with a:
-            st.subheader("First reviewer")
-            with st.form("first", clear_on_submit=False):
-                r_name = st.selectbox("Reviewer (roster)", names, index=None, accept_new_options=True,
-                                      placeholder="type a name") if names else st.text_input("Reviewer name")
-                r_dec = st.radio("Decision", ["Approve", "Revise", "Reject"], horizontal=True)
-                r_opt = st.selectbox("Option to approve (rank 1 by default; others are logged as overrides)", list(opt_labels),
-                                     format_func=opt_labels.get) if opt_labels else None
-                r_reason = st.text_area("Typed reason (required)")
-                r_check = [t for t in tc.REVIEW_CHECKLIST if st.checkbox(t, key="r1" + t)]
-                r_viewed = st.checkbox("I viewed all alternatives before the recommendation", key="r1v")
-                with st.expander("Revision: change constraints (max two)"):
-                    rv_excl = st.multiselect("Exclude option types", list(tc.OPTION_LABELS))
+# ================================================================================================ My task
+with tab_task:
+    if role == "dispatcher":
+        st.subheader(f"{me['icon']} Dispatcher: {me['name']}")
+        if case and case["status"] == "AWAITING_REVIEW":
+            live_countdown(case["case_id"])
+            st.markdown("#### What's happening")
+            st.markdown(plain_summary(case))
+            show_df(simple_options_df(case))
+            explain_more(case)
+            opts = {r["option_id"]: f"#{r['rank']} {r['label']}" for r in ranked_options(case)}
+            with st.form("dispatcher_review"):
+                dec = st.radio("Your decision", ["Approve", "Revise", "Reject"], horizontal=True,
+                               captions=["send it to the supervisor", "ask for other options", "safe default instead"])
+                oid = st.selectbox("Action to approve (the top-ranked one is recommended)", list(opts), format_func=opts.get) \
+                    if opts else None
+                reason = st.text_area("Your reason (required)", placeholder="Why this action? At least 15 characters, e.g. 'Riders need to know about the 25-minute delay now.'")
+                done, viewed = checklist("d")
+                with st.expander("If revising: change the constraints (up to two revisions)"):
+                    rv_excl = st.multiselect("Leave out these action types", list(tc.OPTION_LABELS),
+                                             format_func=tc.OPTION_LABELS.get)
                     rv_budget = st.slider("Budget cap (USD)", 100, 2000, 1000, 50)
-                    rv_hold = st.slider("Max connection hold (min)", 0, 15, 5)
-                    rv_alt = st.checkbox("Allow dispatch from an alternate depot")
-                if st.form_submit_button("Submit first review", type="primary"):
+                    rv_hold = st.slider("Longest connection hold (min)", 0, 15, 5)
+                    rv_alt = st.checkbox("Allow a bus from another depot")
+                if st.form_submit_button(f"Submit as {me['name']}", type="primary"):
                     rev = ({"excluded_options": rv_excl, "budget_cap_usd": float(rv_budget), "max_hold_min": float(rv_hold),
-                            "allow_alternate_depot": rv_alt} if r_dec == "Revise" else None)
-                    run(APP.submit_first, case, r_name or "", r_dec, r_opt, r_reason, r_check, r_viewed, rev); st.rerun()
-        with b:
-            st.subheader("Second reviewer (high-impact actions)")
-            if case["status"] == "AWAITING_SECOND_REVIEW":
-                f = case["review"]["first"]
-                st.info(f"First reviewer {f['reviewer']} approved `{f['option_id']}`: “{f['reason']}”. An independent reviewer must "
-                        "also approve; either can reject.")
-            with st.form("second"):
-                s_name = st.selectbox("Independent reviewer (roster)", names, index=None, accept_new_options=True,
-                                      placeholder="a different person") if names else st.text_input("Independent reviewer name")
-                s_dec = st.radio("Decision", ["Approve", "Reject"], horizontal=True)
-                s_reason = st.text_area("Typed reason (required)", key="s_reason")
-                s_check = [t for t in tc.REVIEW_CHECKLIST if st.checkbox(t, key="r2" + t)]
-                s_viewed = st.checkbox("I viewed all alternatives before the recommendation", key="r2v")
-                if st.form_submit_button("Submit second review", type="primary"):
-                    run(APP.submit_second, case, s_name or "", s_dec, s_reason, s_check, s_viewed); st.rerun()
-        if case.get("rider_alert"):
-            st.markdown(f"**Rider alert (verified info only):** {case['rider_alert']}")
-        st.caption("Human decisions and timing"); show_df(tc.decisions_df(case))
+                            "allow_alternate_depot": rv_alt} if dec == "Revise" else None)
+                    run(APP.submit_first, case, me["name"], dec, oid, reason, done, viewed, rev)
+                    st.rerun()
+        elif case and case["status"] == "CONFLICT_REVIEW":
+            st.warning("Two data sources disagree about this bus. Check it, then choose:")
+            with st.form("operator"):
+                res = st.radio("Result", ["resolved", "unresolved"], horizontal=True,
+                               captions=["trust the vehicle data and continue", "can't tell which is right: keep monitoring"])
+                if st.form_submit_button(f"Submit as {me['name']}", type="primary"):
+                    run(APP.operator_resolve, case, me["name"], res); st.rerun()
+        elif case and case["status"] in ("MONITORING", "SAFE_DEFAULT"):
+            st.info(STATUS_WORDS[case["status"]][0] + (f". Reason: {case.get('safe_default_reason')}" if case.get("safe_default_reason") else ""))
+            c1, c2 = st.columns(2)
+            if c1.button("Recheck with fresh live data"):
+                run(APP.monitor_action, case, "recheck", me["name"]); st.rerun()
+            with c2.popover("Close as a false alarm"):
+                why = st.text_input("Why is it a false alarm?")
+                if st.button("Close case"):
+                    run(APP.close_false_alarm, case, me["name"], why); st.rerun()
+        elif case:
+            st.success("Nothing is waiting for you on this case.")
+        pending_mine = bool(case and case["status"] in ("AWAITING_REVIEW", "CONFLICT_REVIEW"))
+        with st.expander("➕ Open a new case from a live bus", expanded=not pending_mine):
+            choices = tc.vehicle_choices()
+            if not choices:
+                st.caption("No live buses yet. Press **↻ Refresh live data** in the sidebar (Step 1).")
+            else:
+                labels = {vid: lab for lab, vid in choices}
+                vid = st.selectbox("Live bus (most delayed first)", [v for _, v in choices], format_func=labels.get)
+                if st.button("Open case for this bus", type="primary"):
+                    with st.spinner("Checking the data, scoring the options, writing the explanation …"):
+                        c = run(lambda: APP.new_case(tc.raw_for_vehicle(vid), use_llm=use_llm))
+                    if c:
+                        ss["case_id"] = c["case_id"]
+                    st.rerun()
 
-# ---------------------------------------------------------------- 5 implementation and outcome
-with tabs[4]:
-    if not case:
-        st.info("Run the pipeline on a live vehicle first.")
-    else:
-        if case["status"] == "AWAITING_IMPLEMENTATION":
-            st.markdown(f"### ✅ Approved: `{case['approved_option_id']}`\nOperations staff carry out the action outside the "
-                        "prototype and send rider alerts. Record the result below.")
-            with st.form("impl"):
-                i_staff = st.text_input("Operations staff")
-                i_res = st.radio("Result", ["Completed", "Partial", "Failed"], horizontal=True)
-                i_notes = st.text_input("Notes (required for Partial or Failed)")
-                if st.form_submit_button("Record implementation", type="primary"):
-                    run(APP.record_implementation, case, i_staff, i_res, i_notes); st.rerun()
-        for i in case["implementation"]:
-            st.markdown(f"- {i['ts'][:19]} · {i['staff']} · **{i['result']}** · {i['notes']}")
-        st.subheader("Outcome evaluator")
-        st.caption("Enter what was observed after the incident (from operations records). Nothing is simulated; "
-                   "policy weights are never changed automatically.")
-        if case["status"] in ("IMPLEMENTED", "SAFE_DEFAULT", "MONITORING", "EVALUATED"):
+    elif role == "supervisor":
+        st.subheader(f"{me['icon']} Supervisor: {me['name']}")
+        if case and case["status"] == "AWAITING_SECOND_REVIEW":
+            live_countdown(case["case_id"])
+            f = case["review"]["first"]
+            st.markdown(f"<div class='card'><b>{f['reviewer']}</b> (Dispatcher) approved "
+                        f"<b>{option_text(case, f['option_id'])}</b><br><span class='muted'>“{f['reason']}”</span></div>",
+                        unsafe_allow_html=True)
+            st.markdown(plain_summary(case))
+            show_df(simple_options_df(case))
+            explain_more(case)
+            with st.form("supervisor_review"):
+                dec = st.radio("Your decision", ["Approve", "Reject"], horizontal=True,
+                               captions=["send it to the operations officer", "safe default instead"])
+                reason = st.text_area("Your reason (required)", placeholder="At least 15 characters")
+                done, viewed = checklist("s")
+                if st.form_submit_button(f"Submit as {me['name']}", type="primary"):
+                    run(APP.submit_second, case, me["name"], dec, reason, done, viewed); st.rerun()
+        else:
+            st.success("Nothing is waiting for your approval on this case." if case else
+                       "No cases yet. The dispatcher opens cases from live buses.")
+
+    elif role == "officer":
+        st.subheader(f"{me['icon']} Operations Officer: {me['name']}")
+        if case and case["status"] == "AWAITING_IMPLEMENTATION":
+            st.markdown(f"<div class='card'>✅ Approved action: <b>{option_text(case, case['approved_option_id'])}</b><br>"
+                        f"<span class='muted'>Carry it out through normal dispatch, then send the alert to the driver.</span></div>",
+                        unsafe_allow_html=True)
+            sms_on = T.twilio_ready(tc)
+            st.caption(("📱 A text message will go to the driver's phone " + T._mask(T.driver_phone(tc)) + ", and the alert "
+                        "appears on the driver screen.") if sms_on else
+                       "📱 Text messaging isn't set up yet (see System check). The alert will still appear on the driver screen.")
+            with st.form("officer_impl"):
+                body = st.text_area("Message to the driver", T.compose_driver_message(tc, case), height=110, max_chars=320)
+                res = st.radio("Result of the action", ["Completed", "Partial", "Failed"], horizontal=True)
+                notes = st.text_input("Notes (required if Partial or Failed)")
+                if st.form_submit_button("Send alert to driver and record", type="primary"):
+                    def _do():
+                        if res in ("Partial", "Failed") and not notes.strip():
+                            raise ValueError("Describe what went wrong (notes are required for Partial or Failed).")
+                        rec = T.send_driver_alert(tc, case, body, me["name"])
+                        APP.record_implementation(case, me["name"], res, notes)
+                        sms = {"sent": "Text message sent.", "failed": "The text message failed: " + rec["sms_detail"],
+                               "not sent": "Posted to the driver screen (text messaging not set up)."}[rec["sms"]]
+                        APP.last_message = f"Recorded as {res}. {sms}"
+                    run(_do); st.rerun()
+        elif case and case["status"] == "IMPLEMENTED":
+            alerts = case.get("driver_alerts") or []
+            if alerts:
+                a = alerts[-1]
+                st.markdown(f"Driver alert: text **{a['sms']}** · " +
+                            (f"acknowledged by {a['acknowledged_by']} at {a['acknowledged_at'][11:16]} UTC" if a["acknowledged_at"]
+                             else "**not acknowledged yet**"))
+            st.markdown("#### Record the outcome")
+            st.caption("Enter what actually happened, from operations records. Nothing here is estimated by the system.")
             pr = APP.predicted_for(case)
-            st.caption(f"Predicted for {pr['option_id']}: delay reduction {pr['delay_reduction_min']} min, access "
-                       f"{pr['access_protection']}, vulnerable riders {pr['vulnerable_riders_helped']}, cost ${pr['cost_usd']:.0f}")
+            st.caption(f"The system predicted: {pr['delay_reduction_min']} min of delay saved, about "
+                       f"{pr['vulnerable_riders_helped']} riders who depend on transit helped, cost ${pr['cost_usd']:.0f}.")
             with st.form("outcome"):
-                cols = st.columns(3)
+                c1, c2, c3 = st.columns(3)
                 obs = {}
-                for n, (k, lab) in enumerate(list(tc.OBSERVED_FIELDS.items())[:4]):
-                    obs[k] = cols[n % 3].number_input(lab, value=None, placeholder="enter value")
-                obs["rider_reported_impact"] = cols[1].selectbox(tc.OBSERVED_FIELDS["rider_reported_impact"], [1, 2, 3, 4, 5], index=None)
-                fa = cols[2].selectbox(tc.OBSERVED_FIELDS["false_alarm"], ["no", "yes"], index=None)
+                fields = list(tc.OBSERVED_FIELDS.items())
+                for n, (k, lab) in enumerate(fields[:4]):
+                    obs[k] = (c1, c2, c3)[n % 3].number_input(lab, value=None, placeholder="enter value")
+                obs["rider_reported_impact"] = c2.selectbox(tc.OBSERVED_FIELDS["rider_reported_impact"], [1, 2, 3, 4, 5], index=None)
+                fa = c3.selectbox("Was it a false alarm?", ["no", "yes"], index=None)
                 obs["false_alarm"] = {"yes": True, "no": False}.get(fa)
-                if st.form_submit_button("Evaluate outcome", type="primary"):
+                if st.form_submit_button(f"Save outcome as {me['name']}", type="primary"):
                     run(APP.evaluate_outcome, case, obs); st.rerun()
-        a, b = st.columns(2)
-        with a:
+        elif case and case.get("outcome"):
+            st.success("Outcome recorded. This case is closed.")
             show_df(tc.outcome_df(case))
-        with b:
-            st.plotly_chart(tc.outcome_plot(case), width="stretch")
+        else:
+            st.success("Nothing is waiting for you on this case." if case else "No cases yet.")
+        if case and case["status"] in ("IMPLEMENTED", "EVALUATED") and case.get("driver_alerts"):
+            with st.expander("Send another alert to the driver"):
+                with st.form("resend"):
+                    body2 = st.text_area("Message", T.compose_driver_message(tc, case), max_chars=320)
+                    if st.form_submit_button("Send"):
+                        run(lambda: T.send_driver_alert(tc, case, body2, me["name"]), ok="Alert sent again."); st.rerun()
 
-# ---------------------------------------------------------------- 6 policy governance
-with tabs[5]:
-    if st.button("🔍 Run Insight Agent (proposes only)"):
-        props = run(tc.insight_agent, APP)
-        if props is not None:
-            st.session_state["flash"] = ("ok", f"Insight Agent drafted {len(props)} proposal(s). Nothing changes until the "
-                                               "policy owner approves."); st.rerun()
-    st.markdown(APP.insight_narrative or "_Run the Insight Agent to analyse evaluated outcomes._")
-    show_df(tc.proposals_df())
-    if APP.proposals:
-        with st.form("policy"):
-            pid = st.selectbox("Proposal", [p["id"] for p in APP.proposals])
-            owner = st.text_input("Policy owner name")
-            why = st.text_input("Reason (required)")
-            c1, c2, c3 = st.columns(3)
-            if c1.form_submit_button("Preview backtest"):
-                p = next(p for p in APP.proposals if p["id"] == pid)
-                _, summ = tc.run_backtest(APP, tc.apply_changes(APP.PM.current, p["changes"]))
-                st.session_state["flash"] = ("ok", "Preview only — " + summ); st.rerun()
-            if c2.form_submit_button("Approve → backtest → release", type="primary"):
-                run(tc.decide_proposal, APP, pid, owner, "Approve", why); st.rerun()
-            if c3.form_submit_button("Reject (keep current rules)"):
-                run(tc.decide_proposal, APP, pid, owner, "Reject", why); st.rerun()
-    if APP.backtest:
-        st.markdown(APP.backtest["summary"]); show_df(APP.backtest["df"])
-    st.caption("Decision log"); show_df(tc.proposal_log_df())
-    st.caption("Rule versions"); show_df(tc.versions_df())
-    with st.form("rollback"):
-        rb_v = st.selectbox("Roll back to version", [v["version"] for v in APP.PM.versions])
-        rb_o = st.text_input("Policy owner name", key="rb_o")
-        rb_r = st.text_input("Reason (required, ≥ 10 characters)", key="rb_r")
-        if st.form_submit_button("Roll back"):
-            def _rb():
-                if not rb_o.strip() or len(rb_r.strip()) < 10:
-                    raise ValueError("Policy owner name and a reason (≥ 10 characters) are required for rollback.")
-                v = APP.PM.rollback(rb_v, rb_o, rb_r)
-                APP.log(None, rb_o, "policy owner", "Rollback", f"Rules of {rb_v} re-released as v{v}", rb_r)
-                APP.last_message = f"Rules of v{rb_v} are now active as v{v}."
-            run(_rb); st.rerun()
-    with st.expander("Active policy (thresholds, bounds, weights, lookups)"):
-        st.json(APP.PM.current)
+    else:  # driver
+        st.subheader(f"{me['icon']} Driver screen: {me['name']}")
+        inbox = T.driver_inbox(tc)
+        if not inbox:
+            st.info("No alerts yet. Alerts from the operations officer appear here (and by text message, if set up).")
+        for c, i, a in inbox:
+            cls = "alert-sms ack" if a["acknowledged_at"] else "alert-sms"
+            st.markdown(f"<div class='{cls}'><div class='muted'>{a['ts'][11:16]} UTC · from {a['from']} · {c['case_id']} · "
+                        f"text {a['sms']}</div><div class='big' style='margin-top:4px'>{tc._html.escape(a['body'])}</div></div>",
+                        unsafe_allow_html=True)
+            if a["acknowledged_at"]:
+                st.caption(f"✅ Acknowledged at {a['acknowledged_at'][11:16]} UTC")
+            elif st.button("👍 Acknowledge", key=f"ack_{c['case_id']}_{i}", type="primary"):
+                run(T.acknowledge, tc, c, i, me["name"]); st.rerun()
 
-# ---------------------------------------------------------------- 7 ethics and independence
-with tabs[6]:
-    st.markdown(tc.eth_summary_md())
-    st.caption(f"Roster source: {tc.ETH_ROSTER_SOURCE['source']}")
-    show_df(tc.eth_status_df())
-    with st.expander("Load the reviewer roster (JSON)", expanded=not tc.ETH_ROSTER):
-        txt = st.text_area("Roster JSON", json.dumps([o.model_dump() for o in tc.ETH_ROSTER] or tc.ROSTER_TEMPLATE, indent=1),
-                           height=220)
-        save = st.checkbox(f"Also save to {tc.REVIEWER_ROSTER_PATH} (lost on Streamlit Cloud restarts; use the "
-                           "REVIEWER_ROSTER_JSON secret to persist)")
-        if st.button("Load roster"):
-            def _load():
-                n = tc.load_eth_roster(json.loads(txt))
-                tc.ETH_ROSTER_SOURCE["source"] = "pasted in the app"
-                if save:
-                    tc.save_roster()
-                APP.last_message = f"Roster loaded ({n} people)."
-            run(_load); st.rerun()
-    st.subheader("Conflict-of-interest disclosures")
-    st.caption(f"Source: {tc.STAFF_DISCLOSURES_SOURCE['source']}")
-    show_df(tc.disclosures_df())
-    with st.expander("Load disclosures (JSON)", expanded=not tc.STAFF_DISCLOSURES):
-        dtxt = st.text_area("Disclosures JSON", json.dumps(tc.disclosures_as_json() or tc.DISCLOSURE_TEMPLATE, indent=1), height=220)
-        if st.button("Load disclosures"):
-            def _ld():
-                n = tc.load_disclosures(json.loads(dtxt))
-                tc.STAFF_DISCLOSURES_SOURCE["source"] = "pasted in the app"
-                APP.last_message = f"Disclosures loaded ({n} people)."
-            run(_ld); st.rerun()
-    st.caption("Rule screen: each person × each option on the active case"); show_df(tc.coi_screen_df(case))
-    with st.form("gate"):
-        st.markdown("**Run the governance gate for a person**")
-        g_name = st.text_input("Name")
-        g_dec = st.radio("Decision", ["Approve", "Revise", "Reject"], horizontal=True)
-        feas = [o for o in (case["analysis"].get("options", []) if case else []) if o["feasible"]]
-        g_opt = st.selectbox("Option on the active case", [o["option_id"] for o in feas], index=None,
-                             format_func=lambda i: next(o["label"] for o in feas if o["option_id"] == i))
-        if st.form_submit_button("Check"):
-            st.markdown(tc.h_gate(g_name, g_dec, g_opt))
-    if tc.LLM_READY:
-        with st.expander("Section C agent: ask about the roster (LLM + guardrail)"):
-            q = st.text_input("Question", tc.ETH_DEFAULT_QUESTION)
-            if st.button("Run compliance agent"):
-                with st.spinner("Agent working …"):
-                    st.markdown(tc.h_eth_agent(q))
-        with st.expander("Section D multi-agent review of a disclosure (LLM + guardrail)"):
-            who = st.selectbox("Disclosure on file", list(tc.STAFF_DISCLOSURES), index=None)
-            ctext = st.text_area("Case text", tc.STAFF_DISCLOSURES[who]["text"] if who else "")
-            if st.button("Run 5-step conflict-of-interest pipeline") and ctext.strip():
-                with st.spinner("Pipeline running …"):
-                    st.markdown(tc.h_coi_pipeline(ctext))
+# ================================================================================================ Live map
+with tab_map:
+    @st.fragment
+    def live_map():
+        html = tc.map_html(case)
+        if hasattr(st, "iframe"):
+            st.iframe(html, height=560)
+        else:
+            components.html(html, height=560)
+        st.caption(tc.map_status_md())
+    live_map()
+    with st.expander(f"All live buses near Newark Penn ({len(tc.live_vehicles())})"):
+        show_df(tc.live_vehicles_df())
+    if role != "dispatcher":
+        st.caption("To open a case for one of these buses, switch to the Dispatcher role (Step 2).")
 
-# ---------------------------------------------------------------- 8 audit and export
-with tabs[7]:
-    st.caption("All cases (shared case state)"); show_df(tc.cases_df())
-    rs = APP.rubber_stamp_report()
-    st.caption("Rubber-stamp protection: approval patterns and response times"); show_df(rs if len(rs) else tc.ph(None, "No decisions yet"))
-    st.caption("Audit record (newest first)"); show_df(tc.audit_df())
-    if st.button("Prepare export (zip: JSON + CSV + map)"):
-        st.session_state["export"] = tc.export_outputs()
-    if st.session_state.get("export") and os.path.exists(st.session_state["export"]):
-        p = st.session_state["export"]
-        st.download_button("⬇ Download outputs", open(p, "rb").read(), file_name=os.path.basename(p), mime="application/zip")
-    st.caption("Governance boundary: human authority is final; thresholds, bounds and weights are versioned policy assumptions; "
-               "exception paths never trigger resource action; vision data anonymized; community data tract-level only.")
+# ================================================================================================ Case summary
+with tab_case:
+    if not case:
+        st.info("No case selected yet.")
+    else:
+        raw, A = case["raw"], case["analysis"]
+        f = A.get("fields", {})
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Delay", fmt_delay(case))
+        c2.metric("Households without a car", "—" if f.get("transit_dependence") is None else f"{f['transit_dependence']:.0%}")
+        c3.metric("Live weather alerts", len(tc.LIVE_CONTEXT["weather"].get("active_alerts", [])))
+        c4.metric("Priority (0–1)", "—" if not A.get("scores") else f"{A['scores']['P']:.2f}")
+        st.markdown("#### What's happening")
+        st.markdown(plain_summary(case))
+        explain_more(case)
+        st.markdown("#### Possible actions")
+        show_df(simple_options_df(case))
+        inf = [o for o in A.get("options", []) if not o["feasible"]]
+        if inf:
+            st.caption("Not possible right now: " + "; ".join(f"{o['label']} ({o['infeasible_reason']})" for o in inf))
+        if case.get("rider_alert"):
+            st.markdown(f"**Rider alert (verified information only):** {case['rider_alert']}")
+        if case.get("driver_alerts"):
+            st.markdown("#### Driver alerts")
+            for a in case["driver_alerts"]:
+                st.markdown(f"- {a['ts'][11:16]} UTC · {a['from']} → driver · text {a['sms']} · "
+                            + ("✅ acknowledged" if a["acknowledged_at"] else "not acknowledged yet"))
+        st.markdown("#### Timeline")
+        people = {m["name"] for m in TEAM.values()}
+        rows = [{"Time (UTC)": e["ts"][11:19], "Who": e["actor"], "What": e["event"],
+                 "Details": (e["detail"] or "")[:140]} for e in case["audit"]
+                if e["role"] in ("reviewer", "second reviewer", "operations", "driver", "rule") or e["actor"] in people]
+        import pandas as pd
+        show_df(pd.DataFrame(rows) if rows else tc.ph(None, "No events yet"))
+        names = {"vision_ridership": "rider counts", "connecting_services": "connecting service", "incident_history": "incident history",
+                 "operating_resources": "spare buses and depots", "community_access": "neighborhood data", "event_signals": "event report"}
+        if raw.get("sample_inputs"):
+            st.caption("Live: the bus, its delay, NJ Transit alerts, route and stops" +
+                       ("" if "community_access" in raw["sample_inputs"] else ", Census") + ", weather. From v7's sample data "
+                       "(no live source connected): " + ", ".join(names.get(x, x) for x in raw["sample_inputs"]) +
+                       f". Scored on v7 model route {(raw.get('real') or {}).get('model_route_id', raw.get('route_id'))}.")
+
+# ================================================================================================ Records (analysts)
+with tab_records:
+    st.caption("Technical details for analysts and the policy owner. Not needed to run a case.")
+    with st.expander("📈 Scores and formulas (active case)"):
+        if case:
+            a, b = st.columns(2)
+            with a:
+                st.markdown("**Confidence** C = 0.40Q + 0.25F + 0.20G + 0.15M"); show_df(tc.conf_df(case)); st.markdown(tc.sig_md(case))
+            with b:
+                st.plotly_chart(tc.rvap_plot(case), width="stretch")
+            st.markdown("**Normalization and impact**"); show_df(tc.norm_df(case))
+            st.markdown("**Scenario ranking**"); show_df(tc.options_df(case)); st.plotly_chart(tc.options_plot(case), width="stretch")
+    with st.expander("🔎 Evidence, exceptions and alerts (active case)"):
+        if case:
+            show_df(tc.evidence_df(case)); show_df(tc.exceptions_df(case)); show_df(tc.alerts_df(case))
+    with st.expander("📚 All cases, audit record and reviewer patterns"):
+        show_df(tc.cases_df())
+        rs = APP.rubber_stamp_report()
+        st.caption("Rubber-stamp protection: approval patterns and response times")
+        show_df(rs if len(rs) else tc.ph(None, "No decisions yet"))
+        st.caption("Audit record (newest first)"); show_df(tc.audit_df())
+        st.caption("Monitoring queue"); show_df(tc.monitor_df())
+    with st.expander("🛡️ Team training and conflict of interest"):
+        st.markdown(tc.eth_summary_md())
+        st.caption(f"Roster: {T.ROSTER_SOURCE['roster']}")
+        show_df(tc.eth_status_df())
+        st.caption(f"Conflict-of-interest disclosures: {T.ROSTER_SOURCE['disclosures']}")
+        show_df(tc.disclosures_df())
+        with st.form("load_roster"):
+            txt = st.text_area("Replace the roster (JSON)", json.dumps([o.model_dump() for o in tc.ETH_ROSTER], indent=1), height=180)
+            if st.form_submit_button("Load roster"):
+                def _load():
+                    n = tc.load_eth_roster(json.loads(txt)); T.ROSTER_SOURCE["roster"] = "pasted in the app"
+                    APP.last_message = f"Roster loaded ({n} people)."
+                run(_load); st.rerun()
+    with st.expander("⚖️ Policy governance (Insight Agent, rule versions)"):
+        if st.button("Run Insight Agent (proposes only)"):
+            props = run(tc.insight_agent, APP)
+            if props is not None:
+                ss["flash"] = ("ok", f"Insight Agent drafted {len(props)} proposal(s). Nothing changes until the policy owner approves.")
+            st.rerun()
+        st.markdown(APP.insight_narrative or "_Run the Insight Agent after some outcomes are recorded._")
+        show_df(tc.proposals_df())
+        if APP.proposals:
+            with st.form("policy"):
+                pid = st.selectbox("Proposal", [p["id"] for p in APP.proposals])
+                owner = st.text_input("Policy owner name", value=TEAM["supervisor"]["name"])
+                why = st.text_input("Reason (required)")
+                c1, c2 = st.columns(2)
+                if c1.form_submit_button("Approve → backtest → release"):
+                    run(tc.decide_proposal, APP, pid, owner, "Approve", why); st.rerun()
+                if c2.form_submit_button("Reject"):
+                    run(tc.decide_proposal, APP, pid, owner, "Reject", why); st.rerun()
+        if APP.backtest:
+            st.markdown(APP.backtest["summary"]); show_df(APP.backtest["df"])
+        st.caption("Rule versions"); show_df(tc.versions_df())
+    with st.expander("⬇️ Export everything (zip: JSON, CSV and map)"):
+        if st.button("Prepare export"):
+            ss["export"] = tc.export_outputs()
+        if ss.get("export") and os.path.exists(ss["export"]):
+            p = ss["export"]
+            st.download_button("Download", open(p, "rb").read(), file_name=os.path.basename(p), mime="application/zip")
+
+# ================================================================================================ System check
+with tab_check:
+    st.markdown("Tests every connection with your keys. It sends no text message and opens no case.")
+    test_llm = st.checkbox("Also test the AI key (makes one very small paid call)")
+    if st.button("Run system check", type="primary"):
+        with st.spinner("Testing NJ Transit, Census, weather, map, AI and text messaging …"):
+            ss["check"] = T.system_check(tc, test_llm=test_llm)
+    for r in ss.get("check", []):
+        st.markdown(f"{'✅' if r['ok'] else '❌'} **{r['service']}**: {r['detail']}" + (f"  \n↳ *Fix:* {r['fix']}" if r["fix"] else ""))
+    st.caption(tc.map_status_md())
+
+# ================================================================================================ Help
+with tab_help:
+    t = TEAM
+    st.markdown(f"""
+### How to run a case
+
+1. **Step 1 · Live buses.** Press **↻ Refresh live data** in the sidebar. The map shows live NJ Transit buses near
+   Newark Penn Station and the real bus routes.
+2. **Step 2 · Who are you?** Pick your role in the sidebar. Each person sees only their own task on **✅ My task**,
+   and the step tracker at the top shows whose turn it is.
+3. **{t['dispatcher']['name']} (Dispatcher)** picks a delayed bus and presses **Open case for this bus**, reads the
+   recommendation, ticks the checklist, writes a reason and presses **Submit**.
+4. **{t['supervisor']['name']} (Supervisor)** sees the dispatcher's decision, then approves or rejects it with a reason.
+5. **{t['officer']['name']} (Operations Officer)** carries out the approved action, edits the message if needed and
+   presses **Send alert to driver and record**. The driver gets a text message and the alert appears on the driver screen.
+6. **{t['driver']['name']}** opens the driver screen and presses **👍 Acknowledge**.
+7. **{t['officer']['name']}** records the outcome when the incident is over. The case is then closed.
+
+### Good to know
+- **Deadlines are real:** 5, 10 or 20 minutes depending on how serious the case is. If nobody decides in time, the
+  system falls back to the safe default: verified rider information only.
+- **Approvals need training:** only people on the training roster can approve, and nobody can approve their own decision twice.
+- **Missing data stays missing:** if a live source has no data, the system says so instead of guessing.
+- **Nothing is dispatched automatically:** approved actions are recorded for operations staff to carry out.
+- **Something not working?** Open **🔌 System check**.
+""")
