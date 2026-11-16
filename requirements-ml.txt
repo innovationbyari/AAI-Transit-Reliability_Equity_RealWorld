@@ -1,0 +1,8 @@
+# Optional: the small language model (FLAN-T5) and the person detector (Faster R-CNN).
+# Not installed by default: they need about 1.5 GB of memory. To use them, append these lines to requirements.txt
+# and set TRANSIT_USE_SLM = "1" and/or TRANSIT_USE_CV = "1" in the app's secrets.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+transformers
+sentencepiece

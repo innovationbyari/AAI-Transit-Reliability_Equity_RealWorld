@@ -126,7 +126,7 @@ with st.sidebar:
         st.session_state["case_id"] = pick
         APP.active_id = pick
     st.caption(f"Rules v{APP.PM.current['version']} · {'LLM: ' + ', '.join(p['label'] for p in tc.LLM_CHAIN) if tc.LLM_READY else 'LLM off → templates'}"
-               f" · prototype: does not control live operations")
+               f" · decision support: approved actions are recorded, not dispatched automatically")
 
 st.title("Transit Reliability & Equity — human-in-the-loop dashboard")
 flash = st.session_state.pop("flash", None)
@@ -279,8 +279,8 @@ with tabs[4]:
         st.info("Run the pipeline on a live vehicle first.")
     else:
         if case["status"] == "AWAITING_IMPLEMENTATION":
-            st.markdown(f"### ✅ Approved: `{case['approved_option_id']}`\nOperations staff carry out the action outside the "
-                        "prototype and send rider alerts. Record the result below.")
+            st.markdown(f"### ✅ Approved: `{case['approved_option_id']}`\nOperations staff carry out the action through "
+                        "normal dispatch channels and send rider alerts. Record the result below.")
             with st.form("impl"):
                 i_staff = st.text_input("Operations staff")
                 i_res = st.radio("Result", ["Completed", "Partial", "Failed"], horizontal=True)

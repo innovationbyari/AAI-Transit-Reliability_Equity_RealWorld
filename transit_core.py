@@ -1,14 +1,14 @@
 """transit_core — Agentic AI for Public Transit Reliability and Equity (shared library).
 
-Generated from the notebook's core cells (one source of truth). Used by:
-  * the Colab notebook (Run all),
-  * app_gradio.py    (Gradio / Hugging Face Spaces),
-  * app_streamlit.py (Streamlit Community Cloud).
+Generated from the notebook's core cells, then extended for the web app: the map now uses a street basemap
+(CARTO with CARTO_API_KEY, OpenStreetMap otherwise) and draws the real NJ Transit bus routes from GTFS shapes.txt.
+If you regenerate this file from the notebook, carry over add_basemap(), route_network_layer(), the "shapes" GTFS
+table and the GTFSNetwork shape methods. Used by app_streamlit.py (Streamlit Community Cloud).
 
 Live data only: NJ Transit GTFS-realtime + static GTFS, US Census ACS, National Weather Service. Inputs that no live
 source provides are left missing and are never imputed. Secrets are read from Colab Secrets, Streamlit secrets or
 environment variables: NJ_TRANSIT_USERNAME, NJ_TRANSIT_PASSWORD, CENSUS_API_KEY (optional), NWS_CONTACT_EMAIL
-(optional), and optional LLM keys OPENAI_API_KEY / OPENROUTER_API_KEY / HF_API_KEY.
+(optional), CARTO_API_KEY (optional map key), and optional LLM keys OPENAI_API_KEY / OPENROUTER_API_KEY / HF_API_KEY.
 """
 
 
@@ -314,9 +314,6 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 # weather connectors use it. Override with SERVICE_AREA_LAT / SERVICE_AREA_LON environment variables.
 SERVICE_AREA_LATLON = (float(os.environ.get("SERVICE_AREA_LAT", 40.7347)), float(os.environ.get("SERVICE_AREA_LON", -74.1642)))
 CITY_CENTER = SERVICE_AREA_LATLON
-# 1.0 = real review deadlines (5/10/20 min). Set e.g. 0.1 to make deadlines 10x shorter for demos.
-DEMO_DEADLINE_SCALE = 1.0  #@param {type:"number"}
-DEMO_DEADLINE_SCALE = float(os.environ.get("DEMO_DEADLINE_SCALE", DEMO_DEADLINE_SCALE))
 # Every timestamp the notebook shows or saves is in this time zone (EST/EDT for New Jersey).
 LOCAL_TZ_NAME = "America/New_York"  #@param {type:"string"}
 LOCAL_TZ_NAME = os.environ.get("LOCAL_TZ_NAME", LOCAL_TZ_NAME)
@@ -542,20 +539,33 @@ CV_VIDEO_FRAMES = 8  #@param {type:"integer"}
 SHOW_CV_PREVIEW = True  #@param {type:"boolean"}
 import numpy as np
 
-# Sample transit imagery, downloaded at runtime. Only person counts leave this cell; images are not saved.
-#  - bus.jpg: riders at the curb beside a city bus (Ultralytics sample asset, AGPL-3.0)
-#  - vtest.avi: overhead camera of pedestrians on a walkway (OpenCV sample data), used as a station-approach camera
-CV_SOURCES = [
-    {"camera_id": "VISION-STOP-NEWARK-PENN", "kind": "image", "role": "bus stop curb camera",
-     "url": "https://raw.githubusercontent.com/ultralytics/ultralytics/main/ultralytics/assets/bus.jpg",
-     "stop_id": "NEWARK_PENN_BUS_LANE", "capacity": 50,
-     "note": "generic street photo used as a stand-in for a Newark Penn curb camera"},
-    {"camera_id": "VISION-APPROACH-NEWARK-PENN", "kind": "video", "role": "station approach camera",
-     "url": "https://raw.githubusercontent.com/opencv/opencv/4.x/samples/data/vtest.avi",
-     "stop_id": "NEWARK_PENN_APPROACH", "capacity": 50,
-     "note": "public pedestrian video used as a stand-in for a station approach camera"},
-]
-CV_DIR = os.path.join(OUTPUT_DIR, "cv_cache")      # downloaded samples only; nothing derived from them is written here
+# Real camera feeds only. Configure them in the CV_CAMERAS_JSON secret as a JSON list, for example
+#   [{"camera_id": "VISION-STOP-<name>", "kind": "image", "role": "bus stop curb camera",
+#     "url": "<snapshot URL of a camera you are authorized to use>", "stop_id": "<GTFS stop_id>", "capacity": 50}]
+# kind is "image" (a snapshot URL) or "video" (a video file/stream URL). Only person counts are kept; no images.
+# With no camera configured, vision ridership is reported as missing; nothing is substituted.
+def _configured_cameras():
+    text = read_secret("CV_CAMERAS_JSON")
+    if not text:
+        return []
+    try:
+        cams = json.loads(text)
+    except ValueError:
+        print("CV_CAMERAS_JSON is not valid JSON: computer vision has no cameras")
+        return []
+    out = []
+    for c in cams if isinstance(cams, list) else []:
+        if not isinstance(c, dict) or not c.get("url") or c.get("kind") not in ("image", "video"):
+            continue
+        cid = str(c.get("camera_id") or f"camera-{len(out) + 1}")
+        out.append({"camera_id": cid if cid.startswith("VISION-") else "VISION-" + cid, "kind": c["kind"],
+                    "role": c.get("role") or "bus stop curb camera", "url": c["url"], "stop_id": str(c.get("stop_id") or ""),
+                    "capacity": int(c.get("capacity") or 50), "note": c.get("note", "")})
+    return out
+
+
+CV_SOURCES = _configured_cameras()
+CV_DIR = os.path.join(OUTPUT_DIR, "cv_cache")      # temporary frames from the configured cameras; only counts are kept
 os.makedirs(CV_DIR, exist_ok=True)
 _DETECTOR = {"name": None, "model": None, "error": []}
 
@@ -622,13 +632,14 @@ def _nms(boxes, iou=0.4):
     return kept
 
 
-def _download(url):
-    path = os.path.join(CV_DIR, os.path.basename(url))
-    if not os.path.exists(path):
-        r = requests.get(url, timeout=60)
-        r.raise_for_status()
-        with open(path, "wb") as f:
-            f.write(r.content)
+def _download(src):
+    """Fetch the camera's current frame/clip every run (live cameras change); deleted again after counting."""
+    ext = os.path.splitext(src["url"].split("?")[0])[1][:6] or (".jpg" if src["kind"] == "image" else ".mp4")
+    path = os.path.join(CV_DIR, re.sub(r"[^A-Za-z0-9_-]", "_", src["camera_id"]) + ext)
+    r = requests.get(src["url"], timeout=60)
+    r.raise_for_status()
+    with open(path, "wb") as f:
+        f.write(r.content)
     return path
 
 
@@ -669,13 +680,17 @@ def run_computer_vision(sources=CV_SOURCES):
     if not USE_CV:
         results["errors"].append("computer vision disabled")
         return results
+    if not sources:
+        results["errors"].append("no real camera feed configured (CV_CAMERAS_JSON)")
+        return results
     results["detector"] = load_detector()
     if not results["detector"]:
         results["errors"] += _DETECTOR["error"]
         return results
     for src in sources:
+        path = None
         try:
-            path = _download(src["url"])
+            path = _download(src)
             counts, confs, preview = [], [], None
             for idx, rgb in _frames(src, path):
                 boxes = detect_people(rgb)
@@ -697,6 +712,9 @@ def run_computer_vision(sources=CV_SOURCES):
                 results["previews"].append((src["camera_id"], preview))
         except Exception as e:
             results["errors"].append(f"{src['camera_id']}: {type(e).__name__}: {str(e)[:120]}")
+        finally:
+            if path and os.path.exists(path):
+                os.remove(path)            # images are never kept
     return results
 
 
@@ -1091,7 +1109,9 @@ GTFS_TABLES = {
                  "start_date", "end_date"],
     "calendar_dates": ["service_id", "date", "exception_type"],
     "stop_times": ["trip_id", "stop_id", "stop_sequence", "arrival_time", "departure_time"],
+    "shapes": ["shape_id", "shape_pt_lat", "shape_pt_lon", "shape_pt_sequence"],   # real street paths of the routes
 }
+GTFS_SCHEMA_VERSION = "2"   # bump when GTFS_TABLES changes, so cached indexes from older versions are rebuilt
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
 
@@ -1169,6 +1189,9 @@ def build_gtfs_db(zip_path, db_path):
                     if table == "stops":
                         chunk["stop_lat"] = pd.to_numeric(chunk["stop_lat"], errors="coerce")
                         chunk["stop_lon"] = pd.to_numeric(chunk["stop_lon"], errors="coerce")
+                    if table == "shapes":
+                        for c in ("shape_pt_lat", "shape_pt_lon", "shape_pt_sequence"):
+                            chunk[c] = pd.to_numeric(chunk[c], errors="coerce")
                     if table == "stop_times":
                         chunk["stop_sequence"] = pd.to_numeric(chunk["stop_sequence"], errors="coerce")
                         chunk["dep_s"] = chunk["departure_time"].map(gtfs_secs)
@@ -1182,13 +1205,53 @@ def build_gtfs_db(zip_path, db_path):
                 "CREATE INDEX IF NOT EXISTS sp_ll ON stops(stop_lat, stop_lon)",
                 "CREATE TABLE stop_routes AS SELECT DISTINCT st.stop_id AS stop_id, t.route_id AS route_id "
                 "FROM stop_times st JOIN trips t ON st.trip_id = t.trip_id",
-                "CREATE INDEX IF NOT EXISTS sr_stop ON stop_routes(stop_id)"]:
+                "CREATE INDEX IF NOT EXISTS sr_stop ON stop_routes(stop_id)",
+                "CREATE TABLE IF NOT EXISTS shapes (shape_id TEXT, shape_pt_lat REAL, shape_pt_lon REAL, shape_pt_sequence REAL)",
+                "CREATE INDEX IF NOT EXISTS sh_id ON shapes(shape_id, shape_pt_sequence)",
+                "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)",
+                f"INSERT OR REPLACE INTO meta VALUES ('schema', '{GTFS_SCHEMA_VERSION}')"]:
         cur.execute(sql)
     for t in ("calendar", "calendar_dates", "agency"):       # optional files: make sure the tables exist
         cur.execute(f"CREATE TABLE IF NOT EXISTS {t} ({', '.join(c + ' TEXT' for c in GTFS_TABLES[t])})")
     con.commit()
     con.close()
     os.replace(tmp, db_path)
+
+
+def _simplify(pts, tol=0.00004):
+    """Douglas–Peucker line simplification (tolerance in degrees, ~4 m) so the map page stays light."""
+    if len(pts) < 3:
+        return pts
+    keep, stack = {0, len(pts) - 1}, [(0, len(pts) - 1)]
+    while stack:
+        a, b = stack.pop()
+        (y1, x1), (y2, x2) = pts[a], pts[b]
+        dx, dy = x2 - x1, y2 - y1
+        norm = math.hypot(dx, dy) or 1e-12
+        best, idx = 0.0, None
+        for k in range(a + 1, b):
+            y, x = pts[k]
+            d = abs(dy * (x - x1) - dx * (y - y1)) / norm
+            if d > best:
+                best, idx = d, k
+        if idx is not None and best > tol:
+            keep.add(idx)
+            stack += [(a, idx), (idx, b)]
+    return [pts[k] for k in sorted(keep)]
+
+
+def _clip_path(pts, centre, clip_km):
+    """Split a path into the runs of points within clip_km of the centre (routes leave Newark), then simplify each run."""
+    segs, cur = [], []
+    for p in pts:
+        if km_between(p, centre) <= clip_km:
+            cur.append((round(p[0], 6), round(p[1], 6)))
+        elif cur:
+            segs.append(cur)
+            cur = []
+    if cur:
+        segs.append(cur)
+    return [_simplify(sg) for sg in segs if len(sg) > 1]
 
 
 class GTFSNetwork:
@@ -1265,6 +1328,57 @@ class GTFSNetwork:
         out.discard(exclude)
         return sorted(out)
 
+    # ---- real route geometry (shapes.txt)
+    def shape_points(self, shape_id):
+        if not shape_id:
+            return []
+        rows = self.q("SELECT shape_pt_lat AS lat, shape_pt_lon AS lon FROM shapes WHERE shape_id = ? "
+                      "ORDER BY shape_pt_sequence", (shape_id,))
+        return [(r["lat"], r["lon"]) for r in rows if r["lat"] is not None and r["lon"] is not None]
+
+    def trip_path(self, trip_id, stops=None):
+        """The street path a trip follows (its GTFS shape), trimmed to run from the first to the last of `stops`.
+        Empty when the GTFS has no shape for the trip (the map then joins the stops with straight lines)."""
+        t = self.trip(trip_id) if trip_id else None
+        pts = self.shape_points(t.get("shape_id")) if t else []
+        if len(pts) < 2 or not stops:
+            return pts
+        near = lambda s: min(range(len(pts)), key=lambda k: (pts[k][0] - s["lat"]) ** 2 + (pts[k][1] - s["lon"]) ** 2)
+        i, j = near(stops[0]), near(stops[-1])
+        return pts[min(i, j):max(i, j) + 1] if j != i else pts
+
+    def route_paths_near(self, lat, lon, radius_km, clip_km=None, max_routes=80):
+        """Every route that serves a stop within radius_km, drawn along its most-used shape in each direction and
+        clipped to clip_km around the centre. Cached per network, because the map is redrawn on every page refresh."""
+        clip_km = clip_km or max(3.0, radius_km * 2)
+        key = (round(lat, 4), round(lon, 4), radius_km, clip_km, max_routes)
+        cache = self.__dict__.setdefault("_path_cache", {})
+        if key in cache:
+            return cache[key]
+        routes = self.routes_near(lat, lon, radius_km)[:max_routes]
+        out = []
+        if routes:
+            marks = ",".join("?" * len(routes))
+            rows = self.q(f"SELECT route_id, direction_id, shape_id, COUNT(*) AS n FROM trips WHERE route_id IN ({marks}) "
+                          "AND shape_id != '' GROUP BY route_id, direction_id, shape_id", tuple(routes))
+            best = {}
+            for r in rows:
+                k = (r["route_id"], r["direction_id"])
+                if k not in best or r["n"] > best[k]["n"]:
+                    best[k] = r
+            info = {r["route_id"]: r for r in self.q(f"SELECT * FROM routes WHERE route_id IN ({marks})", tuple(routes))}
+            for (rid, direction), r in sorted(best.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]))):
+                segs = _clip_path(self.shape_points(r["shape_id"]), (lat, lon), clip_km)
+                if not segs:
+                    continue
+                ri = info.get(rid, {})
+                color = (ri.get("route_color") or "").strip().lstrip("#")
+                out.append({"route_id": rid, "direction_id": direction, "short_name": ri.get("route_short_name") or rid,
+                            "long_name": ri.get("route_long_name") or "", "segments": segs,
+                            "color": f"#{color}" if len(color) == 6 and color.upper() not in ("FFFFFF", "000000") else None})
+        cache[key] = out
+        return out
+
     # ---- schedule
     def services_on(self, d):
         """service_ids running on date d (calendar + calendar_dates exceptions)."""
@@ -1310,13 +1424,26 @@ class GTFSNetwork:
 _NETWORK = {"net": None, "error": None}
 
 
+def _gtfs_schema(db):
+    try:
+        con = sqlite3.connect(db)
+        try:
+            r = con.execute("SELECT v FROM meta WHERE k = 'schema'").fetchone()
+        finally:
+            con.close()
+        return r[0] if r else None
+    except sqlite3.Error:
+        return None
+
+
 def get_network(force=False):
     """The GTFS network (built on first use and refreshed after GTFS_MAX_AGE_DAYS). Raises LiveDataUnavailable."""
     if _NETWORK["net"] is not None and not force:
         return _NETWORK["net"]
     os.makedirs(GTFS_DIR, exist_ok=True)
     db = os.path.join(GTFS_DIR, "njt_gtfs.sqlite")
-    fresh = os.path.exists(db) and (time.time() - os.path.getmtime(db)) < GTFS_MAX_AGE_DAYS * 86400
+    fresh = os.path.exists(db) and (time.time() - os.path.getmtime(db)) < GTFS_MAX_AGE_DAYS * 86400 \
+        and _gtfs_schema(db) == GTFS_SCHEMA_VERSION
     src_note = os.path.join(GTFS_DIR, "source.txt")
     if force or not fresh:
         zip_path, source = download_gtfs_zip()
@@ -2195,7 +2322,7 @@ def planner_copilot(fields, raw, scores, policy, cons):
         opt("reroute", False, "No verified blockage or closure on the segment", 0, 0, 0, 0, 0, "")
     elif roads.get("detour_announced"):
         opt("reroute", False, "NJ Transit has already announced a detour for this route (see the alert); "
-            "the prototype does not plan a second one", 0, 0, 0, 0, 0, "")
+            "this system does not plan a second one", 0, 0, 0, 0, 0, "")
     elif cancelled:
         opt("reroute", False, "Trip cancelled; nothing to reroute", 0, 0, 0, 0, 0, "")
     elif None in (roads.get("detour_open"), roads.get("detour_extra_min"), roads.get("reroute_allowed")):
@@ -2948,7 +3075,7 @@ STATUS_HELP = {
     "SAFE_DEFAULT": "Safe default: verified rider information only, keep monitoring",
     "AWAITING_REVIEW": "Waiting for human reviewer",
     "AWAITING_SECOND_REVIEW": "High impact — waiting for independent second reviewer",
-    "AWAITING_IMPLEMENTATION": "Approved — operations staff to carry out the action outside the prototype",
+    "AWAITING_IMPLEMENTATION": "Approved — operations staff to carry out the action through normal dispatch channels",
     "IMPLEMENTED": "Action implemented — ready for outcome evaluation",
     "EVALUATED": "Outcome evaluated",
     "CLOSED_FALSE_ALARM": "Closed as false alarm",
@@ -3002,7 +3129,7 @@ class CaseStore:
         self.active_id = None
         self.lock = threading.RLock()
         self.counter = 0
-        self.last_message = "Ready. Pick a scenario and press ▶ Run pipeline."
+        self.last_message = "Ready. Pull live data, pick a live vehicle and press ▶ Run pipeline."
         self.proposals, self.proposal_log, self.backtest = [], [], None
         self.insight_narrative = ""
 
@@ -3128,7 +3255,7 @@ class CaseStore:
         mins = policy["deadlines_min"][tier]
         now = utcnow()
         case["review"] = {"tier": tier, "deadline_min": mins, "started_at": iso(now),
-                          "deadline_at": iso(now + timedelta(seconds=mins * 60 * DEMO_DEADLINE_SCALE)),
+                          "deadline_at": iso(now + timedelta(seconds=mins * 60)),
                           "first": None, "second": None, "required_second": None,
                           "no_feasible_option": not case["analysis"]["ranking"]}
         case["status"] = "AWAITING_REVIEW"
@@ -3229,7 +3356,7 @@ class CaseStore:
             case["review"]["started_at"] = iso(utcnow())  # response time measured per round
             if get_case_policy(case).get("deadline_resets_on_revision"):   # policy flag
                 mins = case["review"]["deadline_min"]
-                case["review"]["deadline_at"] = iso(utcnow() + timedelta(seconds=mins * 60 * DEMO_DEADLINE_SCALE))
+                case["review"]["deadline_at"] = iso(utcnow() + timedelta(seconds=mins * 60))
             case["review"]["no_feasible_option"] = not A["ranking"]
             self.last_message = f"Revision {case['revisions']} rescored. " + (
                 "New deadline started." if get_case_policy(case).get("deadline_resets_on_revision") else "Deadline unchanged.")
@@ -3266,7 +3393,7 @@ class CaseStore:
         case["approved_option_id"] = option_id
         case["status"] = "AWAITING_IMPLEMENTATION"
         self.log(case, "system", "rule", "Implement action", "Approved — handed to operations staff", option_id)
-        self.last_message = f"Approved {option_id}. Operations staff carry it out outside the prototype and send rider alerts."
+        self.last_message = f"Approved {option_id}. Operations staff carry it out through normal dispatch channels and send rider alerts."
 
     def safe_default(self, case, reason):
         case["status"] = "SAFE_DEFAULT"
@@ -3442,7 +3569,7 @@ def llm_narrative(case, attempt=1):
              "options_ranked": [{"rank": r["rank"], "option": r["label"], "Si": r["Si"], "DR": r["DR"], "EB": r["EB"], "AP": r["AP"],
                                  "OF": r["OF"], "CE": r["CE"]} for r in rk],
              "essential_destinations": case["raw"]["access"]["essential_names"]}
-    system = ("You are the Explanation Agent for a transit operations prototype. Explain deterministic results to a human reviewer in plain language. "
+    system = ("You are the Explanation Agent for a transit operations decision-support system. Explain deterministic results to a human reviewer in plain language. "
               "Rules: use ONLY the numbers in the facts; never invent or change numbers; describe the alternatives BEFORE the recommendation; "
               "the recommendation is always the rank-1 option; say the human reviewer makes the final decision; 5 sentences maximum; no headings.")
     if not rk:
@@ -3641,9 +3768,51 @@ def live_vehicle_layer(m, highlight=None):
     fg.add_to(m)
 
 
+CARTO_STYLES = {"voyager": "voyager", "positron": "light_all", "dark-matter": "dark_all"}
+ROUTE_PALETTE = ["#2563eb", "#0891b2", "#7c3aed", "#db2777", "#ea580c", "#16a34a", "#0d9488", "#9333ea", "#c2410c", "#4f46e5"]
+
+
+def add_basemap(m):
+    """Street basemap with street names. CARTO (Voyager by default) needs a free key since 2025: set the CARTO_API_KEY
+    secret (carto.com/basemaps/apikey). Without a key the map uses OpenStreetMap tiles, which also show street names."""
+    key = read_secret("CARTO_API_KEY")
+    style = CARTO_STYLES.get((read_secret("CARTO_STYLE") or "voyager").lower(), "voyager")
+    if key:
+        folium.TileLayer(
+            tiles=f"https://basemaps.cartocdn.com/rastertiles/{style}/{{z}}/{{x}}/{{y}}{{r}}.png?key={key}",
+            attr='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors '
+                 '&copy; <a href="https://carto.com/attributions">CARTO</a>',
+            name="Streets (CARTO)", max_zoom=20).add_to(m)
+    else:
+        folium.TileLayer("OpenStreetMap", name="Streets (OpenStreetMap)", max_zoom=19).add_to(m)
+
+
+def route_network_layer(m, highlight_route=None):
+    """Every NJ Transit bus route serving the service area, drawn along its real street path (GTFS shapes.txt)."""
+    net = _NETWORK.get("net")          # only what is already loaded: drawing the map never starts the GTFS download
+    if net is None:
+        return 0
+    try:
+        paths = net.route_paths_near(*SERVICE_AREA_LATLON, NJT_NEARBY_KM)
+    except sqlite3.Error:
+        return 0
+    fg = folium.FeatureGroup(name=f"NJ Transit bus routes within {NJT_NEARBY_KM} km (GTFS shapes)", show=True)
+    for k, p in enumerate(paths):
+        hot = highlight_route is not None and str(p["route_id"]) == str(highlight_route)
+        col = p["color"] or ROUTE_PALETTE[zlib.crc32(str(p["route_id"]).encode()) % len(ROUTE_PALETTE)]
+        tip = _html.escape(f"Route {p['short_name']}" + (f" · {p['long_name']}" if p["long_name"] else ""))
+        for seg in p["segments"]:
+            folium.PolyLine(seg, color=col, weight=5 if hot else 3, opacity=0.9 if hot else 0.55, tooltip=tip).add_to(fg)
+    fg.add_to(m)
+    return len({p["route_id"] for p in paths})
+
+
 def build_map(case):
-    """Real map: live vehicles, and for the active case its route's remaining stops (static GTFS) coloured by census tract."""
-    m = folium.Map(location=list(SERVICE_AREA_LATLON), zoom_start=14, tiles="CartoDB positron", control_scale=True)
+    """Real map: street basemap, the bus routes serving the area (static GTFS shapes), live vehicles, and for the active
+    case its route's real path and remaining stops coloured by census tract."""
+    m = folium.Map(location=list(SERVICE_AREA_LATLON), zoom_start=14, tiles=None, control_scale=True)
+    add_basemap(m)
+    n_routes = route_network_layer(m, highlight_route=case["raw"].get("route_id") if case else None)
     folium.Marker(list(SERVICE_AREA_LATLON), tooltip="Service area centre", icon=folium.Icon(color="gray", icon="home")).add_to(m)
     folium.Circle(list(SERVICE_AREA_LATLON), radius=NJT_NEARBY_KM * 1000, color="#64748b", weight=1, fill=False,
                   tooltip=f"{NJT_NEARBY_KM} km live-vehicle radius").add_to(m)
@@ -3654,8 +3823,18 @@ def build_map(case):
         tract_by_name = {t["tract_name"]: t for t in raw.get("community", {}).get("tracts", [])}
         fg = folium.FeatureGroup(name=f"{case['case_id']}: route {raw['route_name']} (next stops)", show=True)
         if len(stops) > 1:
-            folium.PolyLine([(s["lat"], s["lon"]) for s in stops], color="#b91c1c", weight=6, opacity=0.85,
-                            tooltip=_html.escape(f"Route {raw['route_name']}: remaining stops of trip {raw.get('trip_id')}")).add_to(fg)
+            path = []
+            net = _NETWORK.get("net")
+            if net is not None and raw.get("trip_id"):
+                try:
+                    path = net.trip_path(raw["trip_id"], stops)
+                except sqlite3.Error:
+                    path = []
+            exact = len(path) > 1
+            folium.PolyLine(path if exact else [(s["lat"], s["lon"]) for s in stops], color="#b91c1c", weight=7, opacity=0.9,
+                            dash_array=None if exact else "8 6",
+                            tooltip=_html.escape(f"Route {raw['route_name']}: path to the next stops of trip {raw.get('trip_id')}"
+                                                 + ("" if exact else " (straight lines: no GTFS shape for this trip)"))).add_to(fg)
         for s in stops:
             t = None
             try:
@@ -3693,7 +3872,10 @@ def build_map(case):
               "font:12px sans-serif;box-shadow:0 1px 4px rgba(0,0,0,.3)'><b>Live NJ Transit data</b><br>"
               "Vehicles: <span style='color:#16a34a'>●</span> on time <span style='color:#f59e0b'>●</span> 5+ min "
               "<span style='color:#b91c1c'>●</span> 15+ min / cancelled <span style='color:#6b7280'>●</span> unknown<br>"
-              "Stops shaded by tract zero-vehicle share (darker = higher; grey = no Census data)</div>")
+              "Stops shaded by tract zero-vehicle share (darker = higher; grey = no Census data)<br>"
+              + (f"Coloured lines: {n_routes} NJ Transit bus routes on their real streets (hover for the route)<br>" if n_routes
+                 else "Bus routes appear once the NJ Transit static GTFS has loaded<br>")
+              + "<span style='color:#b91c1c'>━</span> active case: path to its next stops</div>")
     m.get_root().html.add_child(folium.Element(legend))
     return m
 
@@ -3822,7 +4004,7 @@ def deadline_md(case):
         mm, ss = divmod(max(0, int(left)), 60)
         r = case["review"]
         who = "second reviewer" if st == "AWAITING_SECOND_REVIEW" else "first reviewer"
-        bar = "🟥" if left < 60 * DEMO_DEADLINE_SCALE else "🟧" if left < 180 * DEMO_DEADLINE_SCALE else "🟩"
+        bar = "🟥" if left < 60 else "🟧" if left < 180 else "🟩"
         extra = " · ⚠️ **No feasible option** — revise or reject" if r.get("no_feasible_option") else ""
         return (f"### {bar} {mm:02d}:{ss:02d} left — waiting for {who}\nTier **{r['tier']}** ({r['deadline_min']} min, covers both reviewers) · "
                 f"revisions used {case['revisions']}/{get_case_policy(case)['max_revisions']}{extra}. No response → safe default.")
@@ -3940,19 +4122,14 @@ def export_outputs():
 # ====================================================================================================
 # cell: e5_core
 # ====================================================================================================
-#@title E5 · Gradio dashboard (human-in-the-loop)
-try:
-    import gradio as gr          # needed only for the Gradio dashboard (the Streamlit app does not import it)
-except ImportError:
-    gr = None
+#@title E5 · Dashboard helpers (human-in-the-loop)
 
 
 def banner_md():
     c = APP.active
     llm = f"live LLM: {', '.join(p['label'] for p in LLM_CHAIN)}" if LLM_READY else "LLM off → template narratives"
     head = (f"**Rules v{APP.PM.current['version']}** · {llm} · {len(APP.cases)} case(s) · "
-            f"{len(live_vehicles())} live vehicle(s) · feed pulled {(LIVE_CONTEXT['nj_transit'].get('fetched_at') or 'never')[11:19]} ET · "
-            f"deadline scale ×{DEMO_DEADLINE_SCALE}")
+            f"{len(live_vehicles())} live vehicle(s) · feed pulled {(LIVE_CONTEXT['nj_transit'].get('fetched_at') or 'never')[11:19]} ET")
     if c:
         col = STATUS_COLOR.get(c["status"], "#111")
         head += (f"<br><span style='background:{col};color:white;padding:2px 8px;border-radius:4px'>{c['status']}</span> "
@@ -3960,73 +4137,9 @@ def banner_md():
     return head + f"<br>💬 {_html.escape(APP.last_message)}"
 
 
-def _notify(msg, warn=False):
-    try:
-        (gr.Warning if warn else gr.Info)(msg)
-    except Exception:
-        pass
-
-
-def refresh():
-    c = APP.active
-    feas = [(f"#{r['rank']} {r['label']} (Si {r['Si']:.3f})", r["option_id"]) for r in (c["analysis"]["ranking"] if c else [])]
-    mon_ids = [x["case_id"] for x in APP.cases.values() if x["status"] in ("MONITORING", "SAFE_DEFAULT", "CONFLICT_REVIEW")]
-    expl = c.get("explanation") if c else None
-    second = ""
-    if c and c["status"] == "AWAITING_SECOND_REVIEW":
-        f = c["review"]["first"]
-        second = f"**First reviewer {f['reviewer']}** approved `{f['option_id']}`: “{_html.escape(f['reason'])}”. An independent reviewer must also approve; either can reject."
-    impl = "_No approved action awaiting implementation._"
-    if c and c["status"] == "AWAITING_IMPLEMENTATION":
-        impl = f"### ✅ Approved: `{c['approved_option_id']}`\nOperations staff carry out the action **outside the prototype** and send rider alerts. Record the result below."
-    elif c and c["implementation"]:
-        impl = "\n".join(f"- {i['ts'][:19]} · {i['staff']} · **{i['result']}** · {i['notes']}" for i in c["implementation"])
-    bt = APP.backtest
-    prop_choices = [p["id"] for p in APP.proposals]
-    vers = [v["version"] for v in APP.PM.versions]
-    return [
-        banner_md(),
-        gr.update(choices=list(APP.cases)[::-1], value=APP.active_id),
-        map_iframe(c), trace_md(c), evidence_df(c), exceptions_df(c), alerts_df(c), monitor_df(),
-        gr.update(choices=mon_ids, value=(APP.active_id if APP.active_id in mon_ids else (mon_ids[0] if mon_ids else None))),
-        conf_df(c), norm_df(c), rvap_plot(c), sig_md(c),
-        options_df(c), infeasible_df(c), options_plot(c),
-        expl["brief_md"] if expl else "_Options appear for significant cases._",
-        (f"**Narrative ({expl['narrative_source']}, non-authoritative):** {expl['narrative']}" if expl else ""),
-        deadline_md(c), options_df(c), gr.update(choices=feas, value=feas[0][1] if feas else None), second, decisions_df(c),
-        (f"**Rider alert (verified info only):** {c['rider_alert']}" if c and c.get("rider_alert") else ""),
-        impl, outcome_df(c), outcome_plot(c),
-        json.dumps(APP.PM.current, indent=1), proposals_df(), gr.update(choices=prop_choices, value=prop_choices[0] if prop_choices else None),
-        APP.insight_narrative or "_Run the Insight Agent to analyse outcomes._",
-        bt["summary"] if bt else "_No backtest yet._", ph(bt["df"] if bt else None, "No backtest yet"),
-        versions_df(), gr.update(choices=vers, value=vers[0]), proposal_log_df(),
-        audit_df(), APP.rubber_stamp_report() if len(APP.rubber_stamp_report()) else ph(None, "No decisions yet"), cases_df(),
-        b_audit_df(), eth_summary_md(), eth_status_df(), disclosures_df(), coi_screen_df(c),
-        gr.update(choices=[(o["label"], o["option_id"]) for o in (c["analysis"].get("options", []) if c else []) if o["feasible"]]),
-        live_status_md(), live_vehicles_df(), gr.update(choices=vehicle_choices()),
-        incident_history_df(APP) if len(APP.cases) else ph(None, "No cases recorded yet in this deployment"),
-        gr.update(choices=list(STAFF_DISCLOSURES)),
-    ]
-
-
-def action(fn):
-    def wrapper(*args):
-        with APP.lock:
-            try:
-                msg = fn(*args)
-                if msg:
-                    APP.last_message = msg
-                _notify(APP.last_message)
-            except (ValueError, KeyError, LiveDataUnavailable) as e:
-                APP.last_message = f"⚠️ {e}"
-                _notify(str(e), warn=True)
-            return refresh()
-    return wrapper
-
-
 def _need_case():
     if not APP.active:
-        raise ValueError("Run a scenario first.")
+        raise ValueError("Open a case from a live vehicle first.")
     return APP.active
 
 
@@ -4103,15 +4216,6 @@ def h_second(name, decision, reason, checklist, viewed):
     APP.submit_second(_need_case(), name, decision, reason, checklist, viewed)
 
 
-def h_expire():
-    c = _need_case()
-    if c["status"] not in REVIEW_STATUSES:
-        raise ValueError("No review timer is running.")
-    c["review"]["deadline_at"] = iso(utcnow() - timedelta(seconds=1))
-    APP.log(c, "demo", "tester", "Deadline control", "Deadline expiry simulated")
-    APP.enforce_deadline(c)
-
-
 def h_impl(staff, result, notes):
     APP.record_implementation(_need_case(), staff, result, notes)
 
@@ -4146,13 +4250,6 @@ def h_rollback(version, owner, reason):
     v = APP.PM.rollback(version, owner, reason)
     APP.log(None, owner, "policy owner", "Rollback", f"Rules of {version} re-released as v{v}", reason)
     return f"Rolled back: rules of v{version} are now active as v{v}. Open cases keep the version they were scored with."
-
-
-def tick():
-    with APP.lock:
-        c = APP.active
-        expired = bool(c and APP.enforce_deadline(c))
-        return banner_md() + (" <b>— press ↻ Refresh</b>" if expired else ""), deadline_md(c)
 
 
 # ---- Sections C + D helpers for tab 8
@@ -4258,299 +4355,3 @@ def h_coi_pipeline(text):
             "**Guardrail:** " + ("; ".join(issues) if issues else "✅ consistent with flags, mitigations and the rule screen"))
 
 
-CSS = """
-.gradio-container {max-width: 1500px !important}
-#banner {border-left: 4px solid #2563eb; padding: 6px 12px; background: rgba(37,99,235,.06); border-radius: 6px}
-"""
-
-
-def build_dashboard():
-    if gr is None:
-        raise ImportError("Install gradio to build the Gradio dashboard: pip install 'gradio>=5'")
-    with gr.Blocks(title="Transit Reliability & Equity — HITL Dashboard") as demo:
-        gr.HTML(f"<style>{CSS}</style>")
-        gr.Markdown("# 🚌 Transit Reliability & Equity — Integrated Team System\n"
-                    "Sections A (data inputs + SLM) · B (agents + workflow) · C (ethics training gate) · D (conflict-of-interest gate) · "
-                    "E (engine, dashboard, outputs) — deterministic scoring · human-supervised decisions · **prototype: does not control live transit operations**")
-        banner = gr.Markdown(elem_id="banner")
-        with gr.Row():
-            case_dd = gr.Dropdown(label="Active case", choices=[], interactive=True, scale=3)
-            refresh_btn = gr.Button("↻ Refresh", scale=1)
-        with gr.Tabs():
-            # ---------------- 1
-            with gr.Tab("0 · Live data + SLM (Section A)"):
-                gr.Markdown("**Section A — live data inputs + small language model.** Every value comes from NJ Transit "
-                            "(GTFS-realtime + static GTFS), the US Census ACS or the National Weather Service; inputs with no live "
-                            "source are shown as missing and are never filled in. Pick a vehicle, load its seven sources, then hand "
-                            "them to the Signal Scout. The SLM text is supporting information only.")
-                with gr.Row():
-                    pull_btn = gr.Button("↻ Pull live data (NJ Transit · Census · NWS)", variant="secondary", scale=2)
-                    veh_dd = gr.Dropdown(label="Live vehicle", choices=[], scale=4)
-                live_md = gr.Markdown()
-                live_df = gr.Dataframe(label="Live vehicles near the service area (NJ Transit GTFS-realtime)", interactive=False, wrap=True)
-                with gr.Row():
-                    with gr.Column(scale=3):
-                        a_json = gr.Code(value="", language="json", label="Seven input sources for the selected vehicle (read-only)")
-                    with gr.Column(scale=2):
-                        a_use_slm = gr.Checkbox(value=USE_SLM, label="Use FLAN-T5 small language model (first run downloads ~300 MB)")
-                        a_load = gr.Button("Load the seven sources for this vehicle")
-                        a_run = gr.Button("▶ Collate, interpret and hand off to Signal Scout", variant="primary")
-                        a_slm = gr.Markdown()
-                a_ssi = gr.Code(language="json", label="signal_scout_input (structured hand-off)")
-            with gr.Tab("1 · Intake & verification"):
-                with gr.Row():
-                    use_llm = gr.Checkbox(value=LLM_READY, label="Live LLM narrative", scale=1)
-                    run_btn = gr.Button("▶ Run pipeline on the selected live vehicle", variant="primary", scale=2)
-                with gr.Row():
-                    with gr.Column(scale=3):
-                        map_html = gr.HTML(label="Interactive map")
-                    with gr.Column(scale=2):
-                        trace = gr.Markdown()
-                evidence = gr.Dataframe(label="Verified evidence (accepted / stale / quarantined / excluded)", interactive=False, wrap=True)
-                with gr.Row():
-                    exceptions = gr.Dataframe(label="Exception log", interactive=False, wrap=True)
-                    alerts = gr.Dataframe(label="Alerts (operator, technical owner, planner)", interactive=False, wrap=True)
-                with gr.Accordion("Operator review — conflicting data (max two checks, then monitor)", open=True):
-                    with gr.Row():
-                        op_name = gr.Textbox(label="Operator name", value="")
-                        op_resolve = gr.Button("Resolved: apply source precedence and re-verify")
-                        op_unres = gr.Button("Still unresolved")
-                gr.Markdown("### Monitoring queue (monitoring, safe default, conflict review)")
-                monitor = gr.Dataframe(interactive=False, wrap=True)
-                with gr.Row():
-                    mon_dd = gr.Dropdown(label="Case", choices=[])
-                    mon_name = gr.Textbox(label="Planner name", value="")
-                    mon_reason = gr.Textbox(label="Reason (for false alarm)")
-                with gr.Row():
-                    mon_recheck = gr.Button("Recheck (pull the live feed again)")
-                    mon_fa = gr.Button("Close as false alarm")
-                with gr.Accordion("Incident history (cases recorded by this deployment)", open=False):
-                    history = gr.Dataframe(interactive=False, wrap=True)
-            # ---------------- 2
-            with gr.Tab("2 · Component scores"):
-                with gr.Row():
-                    with gr.Column():
-                        gr.Markdown("**Confidence** C = 0.40Q + 0.25F + 0.20G + 0.15M (proceed when C ≥ 0.70 or an official source verifies a hard trigger)")
-                        conf = gr.Dataframe(interactive=False)
-                        sig = gr.Markdown()
-                    with gr.Column():
-                        rvap = gr.Plot()
-                gr.Markdown("**Normalization and impact** — n(x) = clip((x−L)/(U−L), 0, 1); ninv(x) = 1 − n(x); "
-                            "R = 0.30D + 0.25H + 0.25K + 0.20E · V = 0.35N + 0.25I + 0.20B + 0.20T · A = 0.35S + 0.30L + 0.20X + 0.15U · P = 0.40R + 0.35V + 0.25A")
-                norm = gr.Dataframe(interactive=False, wrap=True)
-            # ---------------- 3
-            with gr.Tab("3 · Options & ranking"):
-                with gr.Row():
-                    with gr.Column(scale=3):
-                        options = gr.Dataframe(label="Scenario table and rank", interactive=False, wrap=True)
-                        infeasible = gr.Dataframe(label="Considered but infeasible", interactive=False, wrap=True)
-                    with gr.Column(scale=2):
-                        options_fig = gr.Plot()
-                explain = gr.Markdown()
-                narrative = gr.Markdown()
-                regen = gr.Button("↻ Regenerate narrative")
-            # ---------------- 4
-            with gr.Tab("4 · Human review"):
-                deadline = gr.Markdown()
-                review_opts = gr.Dataframe(label="All alternatives (review before deciding)", interactive=False, wrap=True)
-                with gr.Row():
-                    with gr.Column():
-                        gr.Markdown("### First reviewer")
-                        r1_name = gr.Textbox(label="Reviewer name", placeholder="name as on the tab 8 roster")
-                        r1_dec = gr.Radio(["Approve", "Revise", "Reject"], value="Approve", label="Decision")
-                        r1_opt = gr.Dropdown(label="Option to approve (defaults to rank 1; other choices are logged as overrides)", choices=[])
-                        r1_reason = gr.Textbox(label="Typed reason (required)", lines=2)
-                        r1_check = gr.CheckboxGroup(REVIEW_CHECKLIST, label="Checklist (all required)")
-                        r1_viewed = gr.Checkbox(label="I viewed all alternatives before the recommendation")
-                        with gr.Accordion("Revision: change constraints / request another option (max two)", open=False):
-                            rv_excl = gr.CheckboxGroup(list(OPTION_LABELS), label="Exclude option types")
-                            rv_budget = gr.Slider(100, 2000, value=1000, step=50, label="Budget cap (USD)")
-                            rv_hold = gr.Slider(0, 15, value=5, step=1, label="Max connection hold (min)")
-                            rv_alt = gr.Checkbox(label="Request option: dispatch from alternate depot")
-                        r1_submit = gr.Button("Submit first review", variant="primary")
-                    with gr.Column():
-                        gr.Markdown("### Second reviewer (high-impact actions)")
-                        second_info = gr.Markdown()
-                        r2_name = gr.Textbox(label="Independent reviewer name", placeholder="a different person on the roster")
-                        r2_dec = gr.Radio(["Approve", "Reject"], value="Approve", label="Decision")
-                        r2_reason = gr.Textbox(label="Typed reason (required)", lines=2)
-                        r2_check = gr.CheckboxGroup(REVIEW_CHECKLIST, label="Checklist (all required)")
-                        r2_viewed = gr.Checkbox(label="I viewed all alternatives before the recommendation")
-                        r2_submit = gr.Button("Submit second review", variant="primary")
-                        expire_btn = gr.Button("⏱ Simulate deadline expiry (demo)", variant="secondary")
-                rider_alert = gr.Markdown()
-                decisions = gr.Dataframe(label="Human decision and timing", interactive=False, wrap=True)
-            # ---------------- 5
-            with gr.Tab("5 · Implementation & outcome"):
-                impl = gr.Markdown()
-                with gr.Row():
-                    im_staff = gr.Textbox(label="Operations staff")
-                    im_res = gr.Radio(["Completed", "Partial", "Failed"], value="Completed", label="Result")
-                    im_notes = gr.Textbox(label="Notes")
-                    im_btn = gr.Button("Record implementation", variant="primary")
-                gr.Markdown("### Outcome evaluator (separate from the recommender; never silently changes policy weights)")
-                with gr.Row():
-                    o_dr = gr.Number(label="Observed delay reduction (min)", value=None)
-                    o_acc = gr.Number(label="Observed access protection (0–1)", value=None)
-                    o_eq = gr.Number(label="Vulnerable riders served", value=None)
-                    o_cost = gr.Number(label="Actual cost (USD)", value=None)
-                    o_imp = gr.Dropdown(["—", "1", "2", "3", "4", "5"], value="—", label="Rider-reported impact (1–5)")
-                    o_fa = gr.Dropdown(["—", "no", "yes"], value="—", label="False alarm")
-                gr.Markdown("_Enter what was observed after the incident (from operations records). Nothing is simulated._")
-                with gr.Row():
-                    eval_btn = gr.Button("Evaluate outcome", variant="primary")
-                with gr.Row():
-                    outcome = gr.Dataframe(label="Outcome evaluation", interactive=False, wrap=True)
-                    outcome_fig = gr.Plot()
-            # ---------------- 6
-            with gr.Tab("6 · Policy governance"):
-                with gr.Row():
-                    insight_btn = gr.Button("🔍 Run Insight Agent (proposes only)", variant="primary")
-                insight_md = gr.Markdown()
-                proposals = gr.Dataframe(label="Proposed changes", interactive=False, wrap=True)
-                with gr.Row():
-                    prop_dd = gr.Dropdown(label="Proposal", choices=[])
-                    owner = gr.Textbox(label="Policy owner name", placeholder="policy owner (on the roster)")
-                    owner_reason = gr.Textbox(label="Reason (required)")
-                with gr.Row():
-                    preview_btn = gr.Button("Preview backtest")
-                    approve_btn = gr.Button("Approve → backtest → release new version", variant="primary")
-                    reject_btn = gr.Button("Reject (keep current rules)", variant="stop")
-                backtest_md = gr.Markdown()
-                backtest = gr.Dataframe(label="Backtest on past cases", interactive=False, wrap=True)
-                proposal_log = gr.Dataframe(label="Decision log", interactive=False, wrap=True)
-                versions = gr.Dataframe(label="Rule versions", interactive=False, wrap=True)
-                with gr.Row():
-                    rb_dd = gr.Dropdown(label="Roll back to version", choices=[])
-                    rb_btn = gr.Button("Roll back")
-                with gr.Accordion("Active policy (thresholds, bounds, weights, lookups)", open=False):
-                    policy_code = gr.Code(language="json")
-            # ---------------- 7
-            with gr.Tab("7 · Audit & export"):
-                cases = gr.Dataframe(label="All live cases (shared case state)", interactive=False, wrap=True)
-                rubber = gr.Dataframe(label="Rubber-stamp protection: approval patterns and response times", interactive=False, wrap=True)
-                audit = gr.Dataframe(label="Audit record (newest first)", interactive=False, wrap=True)
-                b_audit = gr.Dataframe(label="Section B notebook-form cases (audit_table)", interactive=False, wrap=True)
-                with gr.Row():
-                    export_btn = gr.Button("⬇ Export all outputs (zip: JSON + CSV + map)", variant="primary")
-                    export_file = gr.File(label="Download")
-                gr.Markdown("**Governance boundary:** human authority is final; thresholds, bounds and weights are versioned policy assumptions; "
-                            "the recommender cannot change scoring and the evaluator cannot create options; exception paths never trigger resource action; "
-                            "social reports require corroboration; vision data anonymized; community data area-level only.")
-
-            # ---------------- 8
-            with gr.Tab("8 · Ethics & independence (Sections C + D)"):
-                gr.Markdown("**Section C — Ethics Training and Compliance Monitor** and **Section D — Conflict of Interest Detection** "
-                            "protect the review steps. Their deterministic rule engines are the gate (NON_COMPLIANT people cannot approve or revise; "
-                            "a name match between a reviewer's disclosure and a party to the option requires recusal). The LLM agents explain; "
-                            "their guardrails correct them against the rules.")
-                with gr.Row():
-                    with gr.Column(scale=3):
-                        eth_summary = gr.Markdown()
-                        eth_table = gr.Dataframe(label="Ethics training status (Section C rule engine)", interactive=False, wrap=True)
-                    with gr.Column(scale=2):
-                        eth_json = gr.Code(value=json.dumps([o.model_dump() for o in ETH_ROSTER] or ROSTER_TEMPLATE, indent=1),
-                                           language="json", label="Reviewer roster JSON (your real reviewers)")
-                        eth_save = gr.Checkbox(value=False, label=f"Also save to {REVIEWER_ROSTER_PATH}")
-                        eth_load = gr.Button("Load roster")
-                with gr.Row():
-                    g_name = gr.Textbox(label="Check a person", placeholder="e.g. Gabe Ortiz")
-                    g_dec = gr.Radio(["Approve", "Revise", "Reject"], value="Approve", label="Decision")
-                    g_opt = gr.Dropdown(label="Option on the active case", choices=[])
-                    g_btn = gr.Button("Run governance gate")
-                g_md = gr.Markdown()
-                disclosures = gr.Dataframe(label="Conflict-of-interest disclosures on file (Section D facts)", interactive=False, wrap=True)
-                with gr.Accordion("Load disclosures (JSON)", open=not STAFF_DISCLOSURES):
-                    disc_json = gr.Code(value=json.dumps(disclosures_as_json() or DISCLOSURE_TEMPLATE, indent=1), language="json",
-                                        label="Disclosures JSON (facts can be omitted when an LLM key is set)")
-                    disc_save = gr.Checkbox(value=False, label=f"Also save to {STAFF_DISCLOSURES_PATH}")
-                    disc_load = gr.Button("Load disclosures")
-                screen_df = gr.Dataframe(label="Section D rule screen: each person × each option on the active case", interactive=False, wrap=True)
-                with gr.Accordion("Section C agent: ask about the roster (LLM + guardrail)", open=False):
-                    eth_q = gr.Textbox(value=ETH_DEFAULT_QUESTION, label="Question")
-                    eth_run = gr.Button("Run compliance agent")
-                    eth_answer = gr.Markdown()
-                with gr.Accordion("Section D multi-agent review of a disclosure (LLM + guardrail)", open=False):
-                    coi_pick = gr.Dropdown(list(STAFF_DISCLOSURES), label="Disclosure on file")
-                    coi_text = gr.Textbox(value="", lines=4, label="Case text (editable)")
-                    coi_run = gr.Button("Run 5-step conflict-of-interest pipeline")
-                    coi_md = gr.Markdown()
-
-        OUT = [banner, case_dd, map_html, trace, evidence, exceptions, alerts, monitor, mon_dd, conf, norm, rvap, sig,
-               options, infeasible, options_fig, explain, narrative, deadline, review_opts, r1_opt, second_info, decisions, rider_alert,
-               impl, outcome, outcome_fig, policy_code, proposals, prop_dd, insight_md, backtest_md, backtest, versions, rb_dd, proposal_log,
-               audit, rubber, cases, b_audit, eth_summary, eth_table, disclosures, screen_df, g_opt,
-               live_md, live_df, veh_dd, history, coi_pick]
-        demo.load(refresh, outputs=OUT)
-        refresh_btn.click(refresh, outputs=OUT)
-        case_dd.input(action(h_select_case), inputs=[case_dd], outputs=OUT)
-        run_btn.click(action(h_run_vehicle), inputs=[veh_dd, use_llm], outputs=OUT)
-        pull_btn.click(action(h_pull_live), outputs=OUT)
-        op_resolve.click(action(lambda n: h_operator(n, "resolved")), inputs=[op_name], outputs=OUT)
-        op_unres.click(action(lambda n: h_operator(n, "unresolved")), inputs=[op_name], outputs=OUT)
-        mon_recheck.click(action(lambda c, n: h_monitor(c, "recheck", n)), inputs=[mon_dd, mon_name], outputs=OUT)
-        mon_fa.click(action(lambda c, n, r: h_monitor(c, "false_alarm", n, r)), inputs=[mon_dd, mon_name, mon_reason], outputs=OUT)
-        regen.click(action(h_regen), inputs=[use_llm], outputs=OUT)
-        r1_submit.click(action(h_first), inputs=[r1_name, r1_dec, r1_opt, r1_reason, r1_check, r1_viewed, rv_excl, rv_budget, rv_hold, rv_alt], outputs=OUT)
-        r2_submit.click(action(h_second), inputs=[r2_name, r2_dec, r2_reason, r2_check, r2_viewed], outputs=OUT)
-        expire_btn.click(action(h_expire), outputs=OUT)
-        im_btn.click(action(h_impl), inputs=[im_staff, im_res, im_notes], outputs=OUT)
-
-        eval_btn.click(action(h_evaluate), inputs=[o_dr, o_acc, o_eq, o_cost, o_imp, o_fa], outputs=OUT)
-        insight_btn.click(action(h_insight), outputs=OUT)
-        preview_btn.click(action(h_preview), inputs=[prop_dd], outputs=OUT)
-        approve_btn.click(action(lambda p, o, r: h_decide(p, o, "Approve", r)), inputs=[prop_dd, owner, owner_reason], outputs=OUT)
-        reject_btn.click(action(lambda p, o, r: h_decide(p, o, "Reject", r)), inputs=[prop_dd, owner, owner_reason], outputs=OUT)
-        rb_btn.click(action(h_rollback), inputs=[rb_dd, owner, owner_reason], outputs=OUT)
-
-        def _export():
-            with APP.lock:
-                return export_outputs()
-        export_btn.click(_export, outputs=[export_file])
-
-        # ---- Section A tab
-        def _load_a(vid):
-            try:
-                inp = section_a_live_inputs(vid or None, APP)
-                return json.dumps(inp, indent=1, default=str)
-            except LiveDataUnavailable as e:
-                _notify(str(e), warn=True)
-                return ""
-        a_load.click(_load_a, inputs=[veh_dd], outputs=[a_json])
-
-        def _run_a(vid, use_slm, use_llm_):
-            global USE_SLM
-            with APP.lock:
-                extra = [gr.update(), gr.update()]
-                try:
-                    USE_SLM = bool(use_slm)
-                    inputs = section_a_live_inputs(vid or None, APP)
-                    ssi = build_signal_scout_input(inputs)
-                    raw = signal_scout_input_to_raw(ssi)
-                    APP.new_case(raw, use_llm=use_llm_)
-                    wx = ssi.get("external_feeds", {}).get("weather", {})
-                    checks = "".join(f"  \n⚠️ {_html.escape(f)}" for f in ssi["event"].get("slm_cross_check", []))
-                    extra = [f"**SLM reading (supporting only):** {_html.escape(ssi['event']['slm_interpretation'])}{checks}  \n"
-                             f"**Deterministic fields:** delay in alert text = {ssi['event']['delay_min']} min · cause = {ssi['event']['cause']}  \n"
-                             f"**Weather ({_html.escape(str(wx.get('source')))}):** {_html.escape(str(inputs['event_signals'].get('weather')))} · "
-                             f"{len(inputs['event_signals'].get('weather_alerts', []))} active alert(s)  \n"
-                             f"**Missing inputs:** {', '.join(raw['missing_inputs']) or 'none'}  \n"
-                             f"**LLM:** {_html.escape(str(ssi.get('external_feeds', {}).get('llm')))}",
-                             json.dumps(ssi, indent=1, default=str)]
-                    _notify(APP.last_message)
-                except (ValueError, KeyError, TypeError, LiveDataUnavailable) as e:
-                    APP.last_message = f"⚠️ Section A: {e}"
-                    _notify(APP.last_message, warn=True)
-                return refresh() + extra
-        a_run.click(_run_a, inputs=[veh_dd, a_use_slm, use_llm], outputs=OUT + [a_slm, a_ssi])
-
-        # ---- Sections C + D tab
-        eth_load.click(action(h_load_roster), inputs=[eth_json, eth_save], outputs=OUT)
-        disc_load.click(action(h_load_disclosures), inputs=[disc_json, disc_save], outputs=OUT)
-        g_btn.click(h_gate, inputs=[g_name, g_dec, g_opt], outputs=[g_md])
-        eth_run.click(h_eth_agent, inputs=[eth_q], outputs=[eth_answer])
-        coi_pick.change(h_coi_pick, inputs=[coi_pick], outputs=[coi_text])
-        coi_run.click(h_coi_pipeline, inputs=[coi_text], outputs=[coi_md])
-        if hasattr(gr, "Timer"):
-            gr.Timer(2.0).tick(tick, outputs=[banner, deadline])
-    return demo
